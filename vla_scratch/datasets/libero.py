@@ -1,18 +1,15 @@
-from __future__ import annotations
-
 import json
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-import h5py
 import numpy as np
+import h5py
 import torch
 import torch.nn.functional as F
 
-from vla_scratch.datasets.data_types import Observation, ActionChunk, DataSample
+from vla_scratch.datasets.base import Dataset as BaseDataset
 
 
 @dataclass(frozen=True)
@@ -30,93 +27,43 @@ class _DatasetInfo:
     tokenised_prompt_mask: torch.Tensor
 
 
-def _quat_wxyz_to_euler(quaternions: np.ndarray) -> np.ndarray:
-    """Convert quaternions expressed as (w, x, y, z) into roll, pitch, yaw."""
-    if quaternions.shape[-1] != 4:
-        raise ValueError(f"Quaternion input must have size 4 on the last dimension, got {quaternions.shape[-1]}")
-
-    q = np.asarray(quaternions, dtype=np.float64)
-    w = q[..., 0]
-    x = q[..., 1]
-    y = q[..., 2]
-    z = q[..., 3]
-
-    sinr_cosp = 2.0 * (w * x + y * z)
-    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
-    roll = np.arctan2(sinr_cosp, cosr_cosp)
-
-    sinp = 2.0 * (w * y - z * x)
-    sinp_clipped = np.clip(sinp, -1.0, 1.0)
-    pitch = np.arcsin(sinp_clipped)
-
-    siny_cosp = 2.0 * (w * z + x * y)
-    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-    yaw = np.arctan2(siny_cosp, cosy_cosp)
-
-    euler = np.stack((roll, pitch, yaw), axis=-1)
-    return euler.astype(np.float32, copy=False)
-
-
-def _aggregate_state_action_stats(dataset: LiberoDataset) -> tuple[list[tuple[str, np.ndarray]], list[tuple[str, np.ndarray]]]:
-    """Collect flattened arrays for the requested histogram statistics."""
-    grippers: list[np.ndarray] = []
-    eef_positions: list[np.ndarray] = []
-    eef_quaternions: list[np.ndarray] = []
-    actions: list[np.ndarray] = []
-
-    for info in dataset._datasets:
-        with h5py.File(info.path, "r") as handle:
-            data_group = handle["data"]
-            for episode_key in data_group.keys():
-                episode_group = data_group[episode_key]
-                state_arr = np.asarray(episode_group["robot_states"], dtype=np.float32)
-                if state_arr.shape[-1] < 9:
-                    raise ValueError(
-                        f"Expected robot_states to have at least 9 dims (got {state_arr.shape[-1]}) in episode {episode_key}"
-                    )
-                action_arr = np.asarray(episode_group["actions"], dtype=np.float32)
-                grippers.append(state_arr[:, 0:2])
-                eef_positions.append(state_arr[:, 2:5])
-                eef_quaternions.append(state_arr[:, 5:9])
-                actions.append(action_arr)
-
-    if not grippers:
-        raise RuntimeError("No state/action data collected for histogram visualisation.")
-
-    grippers_cat = np.concatenate(grippers, axis=0)
-    eef_pos_cat = np.concatenate(eef_positions, axis=0)
-    eef_euler_cat = _quat_wxyz_to_euler(np.concatenate(eef_quaternions, axis=0))
-    actions_cat = np.concatenate(actions, axis=0)
-
-    state_series: list[tuple[str, np.ndarray]] = [
-        ("gripper_0", grippers_cat[:, 0]),
-        ("gripper_1", grippers_cat[:, 1]),
-        ("eef_x", eef_pos_cat[:, 0]),
-        ("eef_y", eef_pos_cat[:, 1]),
-        ("eef_z", eef_pos_cat[:, 2]),
-        ("eef_roll_rad", eef_euler_cat[:, 0]),
-        ("eef_pitch_rad", eef_euler_cat[:, 1]),
-        ("eef_yaw_rad", eef_euler_cat[:, 2]),
-    ]
-
-    if actions_cat.shape[-1] < 7:
-        raise ValueError(f"Expected actions to have at least 7 dims (got {actions_cat.shape[-1]})")
-
-    action_series: list[tuple[str, np.ndarray]] = [
-        ("delta_eef_x", actions_cat[:, 0]),
-        ("delta_eef_y", actions_cat[:, 1]),
-        ("delta_eef_z", actions_cat[:, 2]),
-        ("delta_axis_x", actions_cat[:, 3]),
-        ("delta_axis_y", actions_cat[:, 4]),
-        ("delta_axis_z", actions_cat[:, 5]),
-        ("gripper_action", actions_cat[:, 6]),
-    ]
-
-    return state_series, action_series
+libero_data_cfg = {
+    "state": [
+        {
+            "name": "gripper_0",
+            "type": "scaler",
+        },
+        {
+            "name": "gripper_1",
+            "type": "scaler",
+        },
+        {
+            "name": "eef_pos",
+            "type": "pos",
+        },
+        {
+            "name": "eef_quat",
+            "type": "quat_wxyz",
+        },
+    ],
+    "actions": [
+        {
+            "name": "delta_eef_pos",
+            "type": "pos",
+        },
+        {
+            "name": "delta_eef_axis_angle",
+            "type": "axis_angle",
+        },
+        {
+            "name": "gripper_action",
+            "type": "scaler",
+        },
+    ],
+}
 
 
-
-class LiberoDataset:
+class LiberoDataset(BaseDataset):
     """PyTorch dataset for LIBERO demonstrations."""
 
     def __init__(
@@ -126,6 +73,7 @@ class LiberoDataset:
         cameras: Sequence[str] | None = None,
         *,
         action_horizon: int = 1,
+        state_history: int = 1,
         image_dtype: torch.dtype = torch.float32,
         max_tokens: int = 256,
         profile: bool = False,
@@ -136,6 +84,7 @@ class LiberoDataset:
         self._tokenizer = tokenizer
         self._image_dtype = image_dtype
         self._max_tokens = max_tokens
+        self._state_history = int(state_history)
         self._action_horizon = int(action_horizon)
         self._target_image_size = (224, 224)
 
@@ -146,8 +95,7 @@ class LiberoDataset:
         self._processed_image_shape: tuple[int, int, int] | None = None
         self._num_cameras: int = 0
 
-        env_profile = str(os.environ.get("LIBERO_PROFILE", "")).strip().lower()
-        self._profile_enabled = bool(profile or env_profile in {"1", "true", "yes", "on"})
+        self._profile_enabled = bool(profile)
         self._profile_totals: dict[tuple[str, ...], float] = {}
         self._profile_counts: dict[tuple[str, ...], int] = {}
         self._profile_stack: list[tuple[tuple[str, ...], float]] = []
@@ -156,6 +104,7 @@ class LiberoDataset:
         if not self._indices:
             raise RuntimeError("No samples found in LIBERO dataset.")
         self._inspect_structure()
+
         self._emit_profile(len(self._indices))
 
     def _resolve_sources(self, root: str | Path) -> list[Path]:
@@ -205,7 +154,9 @@ class LiberoDataset:
                 cameras.sort()
                 self._cameras = tuple(cameras)
             else:
-                missing = [camera for camera in self._cameras if camera not in obs_group]
+                missing = [
+                    camera for camera in self._cameras if camera not in obs_group
+                ]
                 if missing:
                     raise KeyError(
                         f"Requested cameras {missing} not found in episode {reference_entry.episode_key}"
@@ -271,7 +222,12 @@ class LiberoDataset:
         obs_group = episode_group["obs"]
         for camera in self._cameras:
             frame_np = np.asarray(obs_group[camera][step_index], dtype=np.uint8)
-            frame = torch.from_numpy(frame_np).permute(2, 0, 1).contiguous().to(torch.float32)
+            frame = (
+                torch.from_numpy(frame_np)
+                .permute(2, 0, 1)
+                .contiguous()
+                .to(torch.float32)
+            )
             frame = F.interpolate(
                 frame.unsqueeze(0),
                 size=self._target_image_size,
@@ -285,18 +241,19 @@ class LiberoDataset:
         return torch.stack(images, dim=0)
 
     def _load_state(self, episode_group: h5py.Group, step_index: int) -> torch.Tensor:
-        state = np.asarray(episode_group["robot_states"][step_index], dtype=np.float32)
+        history_start = step_index - self._state_history
+        history_end = step_index + self._action_horizon
+        state = np.asarray(
+            episode_group["robot_states"][history_start:history_end], dtype=np.float32
+        )
         return torch.from_numpy(state)
 
     def _load_actions(self, episode_group: h5py.Group, step_index: int) -> torch.Tensor:
         horizon_stop = step_index + self._action_horizon
-        raw_actions = np.asarray(episode_group["actions"][step_index:horizon_stop], dtype=np.float32)
-        actions = torch.from_numpy(raw_actions)
-        if actions.shape[0] != self._action_horizon:
-            padded = torch.zeros(self._action_horizon, self._action_dim, dtype=torch.float32)
-            padded[: actions.shape[0]] = actions
-            actions = padded
-        return actions
+        raw_actions = np.asarray(
+            episode_group["actions"][step_index:horizon_stop], dtype=np.float32
+        )
+        return torch.from_numpy(raw_actions)
 
     def __len__(self) -> int:  # noqa: D401 - inherited behaviour
         return len(self._indices)
@@ -314,16 +271,15 @@ class LiberoDataset:
             state = self._load_state(episode_group, entry.step_index)
             actions = self._load_actions(episode_group, entry.step_index)
 
-        observation = Observation(
+        data_dict = dict(
             images=images,
             image_masks=image_masks,
             state=state,
             tokenized_prompt=dataset_info.tokenised_prompt,
             tokenized_prompt_mask=dataset_info.tokenised_prompt_mask,
+            actions=actions,
         )
-        action = ActionChunk(actions=actions)
-        data_sample = DataSample(observation=observation, action=action)
-        return data_sample
+        return data_dict
 
     @property
     def action_dim(self) -> int:
@@ -346,7 +302,8 @@ class LiberoDataset:
     def episode_keys(self) -> Iterable[str]:
         """Return the episode identifiers present in the dataset."""
         return tuple(
-            f"{self._datasets[index.file_idx].path.name}:{index.episode_key}" for index in self._indices
+            f"{self._datasets[index.file_idx].path.name}:{index.episode_key}"
+            for index in self._indices
         )
 
     def _profile_push_event(self, name: str) -> None:
@@ -378,7 +335,9 @@ class LiberoDataset:
             count = self._profile_counts.get(path, 0)
             node = tree
             for idx, name in enumerate(path):
-                entry = node.setdefault(name, {"stats": {"total": 0.0, "count": 0}, "children": {}})
+                entry = node.setdefault(
+                    name, {"stats": {"total": 0.0, "count": 0}, "children": {}}
+                )
                 if idx == len(path) - 1:
                     entry["stats"]["total"] = total
                     entry["stats"]["count"] = count
@@ -386,8 +345,16 @@ class LiberoDataset:
 
         rows: list[tuple[int, tuple[str, ...], float, int]] = []
 
-        def collect(node_dict: dict[str, dict[str, Any]], path_prefix: tuple[str, ...], depth: int) -> None:
-            items = sorted(node_dict.items(), key=lambda item: item[1]["stats"]["total"], reverse=True)
+        def collect(
+            node_dict: dict[str, dict[str, Any]],
+            path_prefix: tuple[str, ...],
+            depth: int,
+        ) -> None:
+            items = sorted(
+                node_dict.items(),
+                key=lambda item: item[1]["stats"]["total"],
+                reverse=True,
+            )
             for name, content in items:
                 stats: dict[str, Any] = content["stats"]
                 children: dict[str, dict[str, Any]] = content["children"]
@@ -413,7 +380,9 @@ class LiberoDataset:
         ms_width = max(len(ms) for ms in ms_values)
 
         for label, total_str, ms_str in zip(labels, totals, ms_values):
-            print(f"{label:<{label_width}} {total_str:>{total_width}} {ms_str:>{ms_width}}")
+            print(
+                f"{label:<{label_width}} {total_str:>{total_width}} {ms_str:>{ms_width}}"
+            )
 
     def _index_single_file(
         self,
@@ -422,7 +391,9 @@ class LiberoDataset:
     ) -> tuple[_DatasetInfo, list[_IndexEntry]]:
         with h5py.File(dataset_path, "r") as handle:
             if "data" not in handle:
-                raise KeyError(f"Expected group 'data' in LIBERO dataset: {dataset_path}")
+                raise KeyError(
+                    f"Expected group 'data' in LIBERO dataset: {dataset_path}"
+                )
             data_group = handle["data"]
 
             try:
@@ -448,18 +419,23 @@ class LiberoDataset:
                 num_samples = episode_group.attrs.get("num_samples").item()
 
                 max_start = num_samples - self._action_horizon
+                min_start = self._state_history
                 if max_start < 0:
                     continue
+                if min_start > max_start:
+                    continue
 
-                for step in range(max_start + 1):
+                for step in range(min_start, max_start + 1):
                     entries.append(_IndexEntry(file_idx, episode_key, step))
 
             return dataset_info, entries
 
+
 if __name__ == "__main__":
-    from torch.utils.data import DataLoader
-    import matplotlib.pyplot as plt
-    
+    from vla_scratch.datasets.base import TransformedDataset
+    from vla_scratch.datasets.transforms import LiberoProprio, ToTensorClass, Normalize
+    from vla_scratch.datasets.data_types import DataSample
+
     class _ScriptTokenizer:
         def encode(self, prompt: str):  # noqa: D401 - minimal stub
             encoded = np.frombuffer(prompt.encode("utf-8"), dtype=np.uint8)
@@ -477,47 +453,79 @@ if __name__ == "__main__":
     repo_root = Path(__file__).resolve().parents[2]
     dataset_dir = repo_root / "datasets" / "libero_spatial"
     tokenizer = _ScriptTokenizer()
-    dataset = LiberoDataset(dataset_dir, tokenizer=tokenizer, action_horizon=30, profile=True)
+    dataset = LiberoDataset(
+        dataset_dir,
+        tokenizer=tokenizer,
+        action_horizon=30,
+        state_history=10,
+    )
+    transforms = [LiberoProprio(), Normalize(stats_file=repo_root / "normalization_stats" / "libero_proprio_stats.npz"), ToTensorClass()]
+    dataset = TransformedDataset(dataset, transforms)
+
     data_sample: DataSample = dataset[0]
     observation, actions = data_sample.observation, data_sample.action.actions
 
-    print("Loaded sample from:", dataset.episode_keys()[0])
-    for key, img in zip(dataset._cameras, observation.images):
+    print("Loaded sample from:", dataset._dataset.episode_keys()[0])
+    for key, img in zip(dataset._dataset._cameras, observation.images):
         print(f"  {key}:", tuple(img.shape), img.dtype)
-    print("State shape:", tuple(observation.state.shape))
+
     print("ids:", observation.tokenized_prompt.tolist())
     prompt = tokenizer.decode(observation.tokenized_prompt.tolist())
     print("Prompt:", prompt)
+
+    print("State shape:", tuple(observation.state.shape))
     if actions is not None:
         print("Action shape:", tuple(actions.shape))
 
-    state_series, action_series = _aggregate_state_action_stats(dataset)
+    # import matplotlib and use histogram to visualize the distribution of each action dimension
+    # first create a dataloader to load the dataset in batches
+    from torch.utils.data import DataLoader
+    from tqdm import tqdm
 
-    # state: (batch, action_horizon, action_dim=7), action = delta_pos 3 + delta_axis_angle 3 + gripper 1
-    # actions: (batch, state_dim=9), state = gripper 2 + eef_pos 3 + eef_quat 4
+    dataloader = DataLoader(
+        dataset,
+        batch_size=16,
+        shuffle=True,
+        num_workers=8,
+        collate_fn=torch.stack,
+    )
 
-    # in state: gripper 0: [0, 0.04], gripper 1: [-0.04, 0]
-    # in action: gripper: [-1, 1], 1 close, -1 open
+    states = []
+    actions = []
+    for i in tqdm(range(32)):
+        data_sample = next(iter(dataloader))
+        states.append(data_sample.observation.state)
+        actions.append(data_sample.action.actions)
+        del data_sample
+    
+    states = torch.cat(states, dim=0).numpy()[:, ::5, :]
+    actions = torch.cat(actions, dim=0).numpy()[:, ::10, :]
+    states = states.reshape(states.shape[0], -1)
+    actions = actions.reshape(actions.shape[0], -1)
+    
+    # visualize histogram
+    import matplotlib.pyplot as plt
+    num_cols = 5
 
-    # plot histogram for various quantities
-    # state: gripper qpos, eef pos x, y, z, eef euler roll, pitch, yaw
-    # actions: delta eef pos x, y, z, delta eef axis angle x, y, z, gripper
+    num_state_dims = states.shape[1]
+    num_state_rows = (num_state_dims + num_cols - 1) // num_cols
+    fig, axes = plt.subplots(num_state_rows, num_cols, figsize=(4 * num_cols, 3 * num_state_rows))
+    for i in range(num_state_dims):
+        row = i // num_cols
+        col = i % num_cols
+        axes[row, col].hist(states[:, i], bins=50, color='blue', alpha=0.7)
+        axes[row, col].set_title(f'State Dimension {i}')
+    plt.tight_layout()
 
-    def _plot_histograms(series: list[tuple[str, np.ndarray]], title: str) -> None:
-        num_plots = len(series)
-        cols = min(4, num_plots)
-        rows = (num_plots + cols - 1) // cols
-        fig, axes = plt.subplots(rows, cols, figsize=(cols * 4.0, rows * 3.0))
-        flat_axes = np.array(axes, ndmin=1).ravel()
-        for ax, (label, values) in zip(flat_axes, series):
-            ax.hist(values, bins=50, color="steelblue", alpha=0.75)
-            ax.set_title(label)
-            ax.set_ylabel("count")
-        for ax in flat_axes[num_plots:]:
-            ax.remove()
-        fig.suptitle(title)
-        fig.tight_layout()
-
-    _plot_histograms(state_series, "LIBERO State Distribution")
-    _plot_histograms(action_series, "LIBERO Action Distribution")
+    num_action_dims = actions.shape[1]
+    num_action_rows = (num_action_dims + num_cols - 1) // num_cols
+    fig, axes = plt.subplots(num_action_rows, num_cols, figsize=(4 * num_cols, 3 * num_action_rows))
+    for i in range(num_action_dims):
+        row = i // num_cols
+        col = i % num_cols
+        axes[row, col].hist(actions[:, i], bins=50, color='green', alpha=0.7)
+        axes[row, col].set_title(f'Action Dimension {i}')
+    plt.tight_layout()
     plt.show()
+    
+    breakpoint()

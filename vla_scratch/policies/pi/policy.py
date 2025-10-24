@@ -59,6 +59,7 @@ class PiPolicy(nn.Module):
         action_width = action_expert_config.hidden_size
         self.action_in_proj = nn.Linear(config.action_dim, action_width)
         self.action_out_proj = nn.Linear(action_width, config.action_dim)
+        self.state_in_proj = nn.Linear(config.state_dim, action_width)
 
         self.time_mlp = nn.Sequential(
             nn.Linear(action_width, action_width),
@@ -68,9 +69,10 @@ class PiPolicy(nn.Module):
         )
 
         # register buffers
-        suffix_pad_mask = torch.ones(config.action_horizon, dtype=torch.bool)
-        suffix_att_mask = torch.zeros(config.action_horizon, dtype=torch.bool)
-        suffix_att_mask[0] = 1.0
+        suffix_len = config.action_horizon + config.state_history
+        suffix_pad_mask = torch.ones(suffix_len, dtype=torch.bool)
+        suffix_att_mask = torch.zeros(suffix_len, dtype=torch.bool)
+        suffix_att_mask[0] = 1 # create a new attention block for the suffix, prefix should not attend to suffix
         self.register_buffer("suffix_pad_mask", suffix_pad_mask, persistent=False)
         self.register_buffer("suffix_att_mask", suffix_att_mask, persistent=False)
         self.suffix_pad_mask: at.Bool[torch.Tensor, "action_horizon"]
@@ -116,11 +118,7 @@ class PiPolicy(nn.Module):
         )
 
         torch.cuda.nvtx.range_push("language_embedding")
-        def lang_embed_func(lang_tokens):
-            lang_emb = self.paligemma.language_model.embed_tokens(lang_tokens)
-            lang_emb_dim = lang_emb.shape[-1]
-            return lang_emb * math.sqrt(lang_emb_dim)
-        lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
+        lang_emb = self._apply_checkpoint(self.paligemma.language_model.embed_tokens, lang_tokens)
         torch.cuda.nvtx.range_pop()
 
         embs.append(lang_emb)
@@ -138,7 +136,7 @@ class PiPolicy(nn.Module):
 
     def embed_suffix(
         self,
-        state: at.Float[torch.Tensor, "*batch_size state_dim"],
+        state: at.Float[torch.Tensor, "*batch_size state_history state_dim"],
         noisy_actions: at.Float[torch.Tensor, "*batch_size action_horizon action_dim"],
         time: at.Float[torch.Tensor, "*batch_size"],
     ) -> tuple[
@@ -160,6 +158,8 @@ class PiPolicy(nn.Module):
         time_emb = self._apply_checkpoint(self.time_mlp.forward, time_emb)
 
         action_emb = self._apply_checkpoint(self.action_in_proj.forward, noisy_actions)
+        state_emb = self._apply_checkpoint(self.state_in_proj.forward, state)
+        suffix_emb = torch.cat([action_emb, state_emb], dim=1)
 
         bsize = action_emb.shape[0]
         pad_mask = einops.repeat(
@@ -169,7 +169,7 @@ class PiPolicy(nn.Module):
             self.suffix_att_mask, "action_horizon -> b action_horizon", b=bsize
         )
 
-        return action_emb, pad_mask, att_mask, time_emb
+        return suffix_emb, pad_mask, att_mask, time_emb
 
     def encode_prefix(
         self, observation: Observation
@@ -213,9 +213,9 @@ class PiPolicy(nn.Module):
 
             # attention
             torch.cuda.nvtx.range_push(f"project_qkv")
-            q = layer.self_attn.q_proj(pre_att).view(head_shape).transpose(-3, -2)
-            k = layer.self_attn.k_proj(pre_att).view(head_shape).transpose(-3, -2)
-            v = layer.self_attn.v_proj(pre_att).view(head_shape).transpose(-3, -2)
+            q = layer.self_attn.q_proj(pre_att).view(head_shape).transpose(1, 2)
+            k = layer.self_attn.k_proj(pre_att).view(head_shape).transpose(1, 2)
+            v = layer.self_attn.v_proj(pre_att).view(head_shape).transpose(1, 2)
             torch.cuda.nvtx.range_pop()
 
             torch.cuda.nvtx.range_push(f"rotary_embedding")
@@ -231,7 +231,9 @@ class PiPolicy(nn.Module):
                 attn_mask=prefix_att_mask,
                 scale=layer.self_attn.scaling,
             )
-            out_att = out_att.reshape(*input_shape, -1).contiguous()
+            out_att = out_att.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+            # print(out_att)
+            # breakpoint()
             out_att = layer.self_attn.o_proj(out_att)
             res_att = hidden_states + out_att
             torch.cuda.nvtx.range_pop()
@@ -243,9 +245,12 @@ class PiPolicy(nn.Module):
             torch.cuda.nvtx.range_pop()
             return res_mlp, (k_rotate, v)
 
-        hidden_states = prefix_embs
+        hidden_size = prefix_embs.shape[-1]
+        hidden_states = prefix_embs * math.sqrt(hidden_size)
+
         kv_cache_list: List[KVCache] = []
         for i, layer in enumerate(model.layers):
+            # print(f"layer {i}: {hidden_states}")
             torch.cuda.nvtx.range_push(f"layer_{i}")
             hidden_states, (k, v) = self._apply_checkpoint(
                 compute_layer, layer, hidden_states
@@ -254,6 +259,7 @@ class PiPolicy(nn.Module):
 
             kv_cache_list.append((k, v))
 
+        hidden_states = model.norm(hidden_states)
         return hidden_states, prefix_pad_masks, kv_cache_list
 
     def predict_suffix(
@@ -292,7 +298,7 @@ class PiPolicy(nn.Module):
             attention_mask=full_att_mask,
             past_key_values=prefix_key_values,
         )
-
+        suffix_out = suffix_out[:, :self.config.action_horizon, :]
         return self.action_out_proj(suffix_out)
 
     @torch.inference_mode()

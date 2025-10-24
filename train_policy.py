@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
+import math
 import os
+import time
 from typing import cast
 from tqdm import tqdm
+import wandb
+import datetime
+from setproctitle import setproctitle
 
 import torch
 import torch.nn.functional as F
@@ -19,6 +24,8 @@ from torch.distributed.fsdp import (
     ShardingStrategy,
 )
 from torch.distributed.checkpoint.state_dict import get_state_dict, StateDictOptions
+
+from tensordict import TensorDict
 
 import hydra
 from hydra.core.config_store import ConfigStore
@@ -37,6 +44,7 @@ class TrainConfig:
     # optimization
     epochs: int = 5
     batch_size: int = 32
+    grad_accum_steps: int = 1
     lr: float = 3e-5
     weight_decay: float = 1e-4
     optim_eps: float = 1e-8
@@ -45,12 +53,17 @@ class TrainConfig:
     action_expert_variant: str = "300m"
     paligemma_checkpoint: str | None = None
     action_horizon: int = 30
+    state_history: int = 10
     # logging and evaluation
     log_interval: int = 20
     eval_interval: int = 40
     eval_fraction: float = 0.1
     eval_num_sample_steps: int = 10
     save_path: Path | None = None
+    # wandb
+    exp_name: str = "pi-training"
+    wandb_project: str = "vla-scratch"
+    wandb_mode: str = "disabled"
 
 
 cs = ConfigStore.instance()
@@ -105,6 +118,30 @@ def load_checkpoint(model: PiPolicy, checkpoint: str) -> None:
         torch.cuda.empty_cache()
 
 
+def save_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    train_cfg: TrainConfig,
+    global_rank: int,
+    filename: str,
+):
+    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    model_state_dict, optim_state_dict = get_state_dict(
+        model,
+        optimizers=optimizer,
+        options=options,
+    )
+
+    if global_rank == 0 and train_cfg.save_path is not None:
+        train_cfg.save_path.parent.mkdir(parents=True, exist_ok=True)
+        full_state_dict = {
+            "model": model_state_dict,
+            "optimizer": optim_state_dict,
+        }
+        torch.save(full_state_dict, filename)
+        print(f"Saved checkpoint to {filename}")
+
+
 def setup_ddp():
     """
     Initialize DDP process group
@@ -138,8 +175,18 @@ def create_dataloaders(train_cfg: TrainConfig, world_size: int, global_rank: int
         train_cfg.data_root,
         tokenizer=tokenizer,
         action_horizon=train_cfg.action_horizon,
+        state_history=train_cfg.state_history,
         max_tokens=128,
     )
+    from vla_scratch.datasets.base import TransformedDataset
+    from vla_scratch.datasets.transforms import LiberoProprio, ToTensorClass, Normalize
+
+    transforms = [
+        LiberoProprio(),
+        Normalize(stats_file=Path("normalization_stats/libero_proprio_stats.npz")),
+        ToTensorClass(),
+    ]
+    full_dataset = TransformedDataset(full_dataset, transforms)
 
     total_samples = len(full_dataset)
     eval_size = max(1, int(total_samples * train_cfg.eval_fraction))
@@ -200,13 +247,13 @@ def create_dataloaders(train_cfg: TrainConfig, world_size: int, global_rank: int
         subtrain_dataset, shuffle=False, batch_size=32
     )
     return (
-        full_dataset,
         dataloader,
         eval_dataloader,
         subtrain_dataloader,
     )
 
 
+@torch.inference_mode()
 def compute_sample_mse(
     model: PiPolicy,
     dataloader: DataLoader,
@@ -216,29 +263,47 @@ def compute_sample_mse(
 ) -> torch.Tensor:
     squared_errors = []
 
-    with torch.inference_mode():
-        pbar = range(len(dataloader))
-        if global_rank == 0:
-            pbar = tqdm(pbar, desc=f"Evaluating sample MSE")
-        for i in pbar:
-            batch = next(iter(dataloader))
-            batch: DataSample = batch.to(device)
-            predicted_actions = model.forward(
-                part="sample",
-                observation=batch.observation,
-                num_steps=num_sample_steps,
-            )
-            target_actions = batch.action.actions
+    pbar = range(len(dataloader))
+    if global_rank == 0:
+        pbar = tqdm(pbar, desc=f"Evaluating sample MSE")
+    for i in pbar:
+        batch = next(iter(dataloader))
+        batch: DataSample = batch.to(device)
+        predicted_actions = model.forward(
+            part="sample",
+            observation=batch.observation,
+            num_steps=num_sample_steps,
+        )
+        target_actions = batch.action.actions
 
-            squared_error = F.mse_loss(
-                predicted_actions,
-                target_actions,
-                reduction="none",
-            )
-            squared_errors.append(squared_error.mean())
+        squared_error = F.mse_loss(
+            predicted_actions,
+            target_actions,
+            reduction="none",
+        )
+        squared_errors.append(squared_error.mean())
 
     return torch.stack(squared_errors).mean()
 
+def get_fsdp_wrap_policy():
+    """Get the FSDP auto wrap policy for PaliGemma model.
+    
+    Returns:
+        FSDP transformer auto wrap policy
+    """
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+    import functools
+    from vla_scratch.policies.modules.dit import DecoderBlock
+    from transformers.models.gemma.modeling_gemma import GemmaDecoderLayer
+    
+    transformer_wrap_policy = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls=[
+            DecoderBlock,
+            # GemmaDecoderLayer,
+        ],
+    )
+    return transformer_wrap_policy
 
 @hydra.main(config_name="train", version_base=None)
 def main(cfg: DictConfig) -> None:
@@ -249,7 +314,7 @@ def main(cfg: DictConfig) -> None:
     train_cfg.data_root = Path(to_absolute_path(str(train_cfg.data_root)))
     if train_cfg.save_path is not None:
         train_cfg.save_path = Path(to_absolute_path(str(train_cfg.save_path)))
-    
+
     assert (
         train_cfg.eval_interval % train_cfg.log_interval == 0
     ), "eval-interval must be multiple of log-interval"
@@ -258,18 +323,24 @@ def main(cfg: DictConfig) -> None:
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
     (
-        full_dataset,
         dataloader,
         eval_dataloader,
         subtrain_dataloader,
     ) = create_dataloaders(train_cfg, world_size, global_rank)
 
+    dummy_data: DataSample = next(iter(dataloader))
+    action_dim = dummy_data.action.actions.shape[-1]
+    state_dim = dummy_data.observation.state.shape[-1]
+
     base_config = PiConfig(
         action_expert_variant=train_cfg.action_expert_variant,
-        action_dim=full_dataset.action_dim,
+        action_dim=action_dim,
         action_horizon=train_cfg.action_horizon,
+        state_dim=state_dim,
+        state_history=train_cfg.state_history,
     )
-    model = PiPolicy(base_config).to(device)
+    with torch.device(device):
+        model = PiPolicy(base_config)
 
     if local_rank == 0 and train_cfg.paligemma_checkpoint:
         load_checkpoint(model, train_cfg.paligemma_checkpoint)
@@ -300,6 +371,7 @@ def main(cfg: DictConfig) -> None:
             backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
             device_id=local_rank,
             sync_module_states=True,
+            # auto_wrap_policy=get_fsdp_wrap_policy(),
         )
         print(f"Wrapped model in FSDP: global_rank={global_rank}")
 
@@ -312,90 +384,143 @@ def main(cfg: DictConfig) -> None:
         fused=True,
     )
 
+    if global_rank == 0:
+        run = wandb.init(
+            project=train_cfg.wandb_project,
+            mode=train_cfg.wandb_mode,
+        )
+        run.config.update(OmegaConf.to_container(cfg))
+
+        default_run_name = (
+            f"{train_cfg.exp_name}-{datetime.datetime.now().strftime('%m-%d-%H-%M')}"
+        )
+        run_idx = run.name.split("-")[-1]
+        run.name = f"{run_idx}-{default_run_name}"
+        setproctitle(run.name)
+
     time_dist = get_beta_dist(1.0, 1.5, device=device)
 
     global_step = 0
+    last_time = time.perf_counter()
     for epoch in range(train_cfg.epochs):
         data_loader_iter = iter(dataloader)
         if isinstance(dataloader.sampler, DistributedSampler):
             dataloader.sampler.set_epoch(epoch)
 
-        running_losses = []
+        log_tds = []
 
-        pbar = range(len(dataloader))
+        pbar = range(len(dataloader) // train_cfg.grad_accum_steps)
         if global_rank == 0:
             pbar = tqdm(pbar, desc=f"Epoch {epoch+1}/{train_cfg.epochs}")
 
         model.train()
         for i in pbar:
-            torch.cuda.nvtx.range_push("DataLoader")
-            data_sample = next(data_loader_iter)
-            data_sample: DataSample = data_sample.to(device)
-            torch.cuda.nvtx.range_pop()
-
-            torch.cuda.nvtx.range_push("Optimizer Zero Grad")
+            torch.cuda.nvtx.range_push("Zero Grad")
             optimizer.zero_grad(set_to_none=True)
             torch.cuda.nvtx.range_pop()
 
-            torch.cuda.nvtx.range_push("Model Encode Prefix")
-            _, prefix_pad_masks, prefix_key_values = model.forward(
-                part="prefix",
-                observation=data_sample.observation,
-            )
-            torch.cuda.nvtx.range_pop()
+            for _ in range(train_cfg.grad_accum_steps):
+                torch.cuda.nvtx.range_push("DataLoader")
+                data_sample = next(data_loader_iter)
+                data_sample: DataSample = data_sample.to(device)
+                torch.cuda.nvtx.range_pop()
 
-            torch.cuda.nvtx.range_push("Noise Sampling")
-            actions = data_sample.action.actions
-            noise = sample_noise(actions.shape, device, dtype=actions.dtype)
-            u_t = noise - actions
-            time = sample_time(time_dist, data_sample.batch_size)
-            noisy_actions = actions + time[:, None, None] * u_t
-            torch.cuda.nvtx.range_pop()
+                torch.cuda.nvtx.range_push("Model Encode Prefix")
+                _, prefix_pad_masks, prefix_key_values = model.forward(
+                    part="prefix",
+                    observation=data_sample.observation,
+                )
+                torch.cuda.nvtx.range_pop()
 
-            torch.cuda.nvtx.range_push("Model Predict Suffix")
-            v_t = model.forward(
-                part="suffix",
-                state=data_sample.observation.state,
-                prefix_pad_masks=prefix_pad_masks,
-                prefix_key_values=prefix_key_values,
-                noisy_actions=noisy_actions,
-                time=time,
-            )
-            losses = F.mse_loss(u_t.type_as(v_t), v_t, reduction="none")
-            loss = losses.mean()
-            torch.cuda.nvtx.range_pop()
+                torch.cuda.nvtx.range_push("Noise Sampling")
+                actions = data_sample.action.actions
+                noise = sample_noise(actions.shape, device, dtype=actions.dtype)
+                u_t = noise - actions
+                timestep = sample_time(time_dist, data_sample.batch_size)
+                noisy_actions = actions + timestep[:, None, None] * u_t
+                torch.cuda.nvtx.range_pop()
 
-            torch.cuda.nvtx.range_push("Loss Backward")
-            loss.backward()
+                torch.cuda.nvtx.range_push("Model Predict Suffix")
+                v_t = model.forward(
+                    part="suffix",
+                    state=data_sample.observation.state,
+                    prefix_pad_masks=prefix_pad_masks,
+                    prefix_key_values=prefix_key_values,
+                    noisy_actions=noisy_actions,
+                    time=timestep,
+                )
+                losses = F.mse_loss(u_t.type_as(v_t), v_t, reduction="none")
+                loss = losses.mean()
+                torch.cuda.nvtx.range_pop()
+
+                torch.cuda.nvtx.range_push("Loss Backward")
+                (loss / math.sqrt(train_cfg.grad_accum_steps)).backward()
+                torch.cuda.nvtx.range_pop()
+
+            torch.cuda.nvtx.range_push("Optimizer Step")
             norm_before_clip = clip_grad_norm_(
                 model.parameters(),
                 max_norm=train_cfg.clip_grad_norm,
                 norm_type=2.0,
                 pg=pg if world_size > 1 else None,
             )
-            torch.cuda.nvtx.range_pop()
-
-            torch.cuda.nvtx.range_push("Optimizer Step")
             optimizer.step()
             torch.cuda.nvtx.range_pop()
 
-            running_losses.append(loss.detach())
-            global_step += 1
+            data_stats_td = {
+                "data/observation.state.mean": data_sample.observation.state.mean().detach(),
+                "data/observation.state.std": data_sample.observation.state.std().detach(),
+                "data/observation.state.min": data_sample.observation.state.min().detach(),
+                "data/observation.state.max": data_sample.observation.state.max().detach(),
+                "data/observation.images.mean": data_sample.observation.images.mean().detach(),
+                "data/observation.images.std": data_sample.observation.images.std().detach(),
+                "data/observation.images.min": data_sample.observation.images.min().detach(),
+                "data/observation.images.max": data_sample.observation.images.max().detach(),
+                "data/action.mean": data_sample.action.actions.mean().detach(),
+                "data/action.std": data_sample.action.actions.std().detach(),
+                "data/action.min": data_sample.action.actions.min().detach(),
+                "data/action.max": data_sample.action.actions.max().detach(),
+            }
+            log_td = {}
+            log_td["loss/flow_mse"] = loss.detach()
+            log_td["loss/grad_norm"] = norm_before_clip.detach()
+            # log_td.update(data_stats_td)
 
+            log_tds.append(TensorDict(log_td, []))
+
+            global_step += 1
             if global_step % train_cfg.log_interval == 0:
+                # log metrics
                 log_dict = {
                     "epoch": epoch,
                     "step": global_step,
-                    "samples": global_step * train_cfg.batch_size * world_size,
+                    "samples": global_step
+                    * train_cfg.batch_size
+                    * world_size
+                    * train_cfg.grad_accum_steps,
                 }
-                running_loss = torch.stack(running_losses).mean()
-                if world_size > 1:
-                    dist.all_reduce(running_loss, op=dist.ReduceOp.AVG)
-                running_losses.clear()
-
-                log_dict["loss/grad_norm"] = norm_before_clip.item()
                 log_dict["loss/lr"] = optimizer.param_groups[0]["lr"]
-                log_dict["loss/flow_mse"] = running_loss.item()
+
+                # log fps
+                this_time = time.perf_counter()
+                elapsed_time = this_time - last_time
+                last_time = this_time
+                fps = (
+                    train_cfg.batch_size
+                    * train_cfg.grad_accum_steps
+                    / elapsed_time
+                )
+                log_dict["perf/fps"] = fps
+                log_dict["perf/fps.total"] = fps * world_size
+
+                # log train stats
+                log_td_stack: TensorDict = torch.stack(log_tds, dim=0)
+                if world_size > 1:
+                    for tensor in log_td_stack.values(leaves_only=True):
+                        dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
+                log_tds.clear()
+                log_td_mean = log_td_stack.type(torch.float32).mean(dim=0)
+                log_dict.update(log_td_mean.cpu().numpy())
 
                 if global_step % train_cfg.eval_interval == 0:
                     if world_size > 1:
@@ -424,6 +549,7 @@ def main(cfg: DictConfig) -> None:
                     model.train()
 
                 if global_rank == 0:
+                    run.log(log_dict)
                     log_string = "\n".join(
                         [
                             (
@@ -436,21 +562,9 @@ def main(cfg: DictConfig) -> None:
                     )
                     print(log_string)
 
-    options = StateDictOptions(full_state_dict=True, cpu_offload=True)
-    model_state_dict, optim_state_dict = get_state_dict(
-        model,
-        optimizers=optimizer,
-        options=options,
-    )
-
-    if global_rank == 0 and train_cfg.save_path is not None:
-        train_cfg.save_path.parent.mkdir(parents=True, exist_ok=True)
-        full_state_dict = {
-            "model": model_state_dict,
-            "optimizer": optim_state_dict,
-        }
-        torch.save(full_state_dict, train_cfg.save_path)
-        print(f"Saved checkpoint to {train_cfg.save_path}")
+        save_checkpoint(
+            model, optimizer, train_cfg, global_rank, f"checkpoint_{epoch+1}.pth"
+        )
 
     if world_size > 1:
         dist.destroy_process_group()

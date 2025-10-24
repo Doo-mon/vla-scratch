@@ -237,7 +237,7 @@ class Attention(nn.Module):
             scale=self.scaling,
             enable_gqa=True,
         )
-        attn_output = attn_output.reshape(batch, seq_len, -1).contiguous()
+        attn_output = attn_output.transpose(1, 2).reshape(batch, seq_len, -1).contiguous()
         return self.o_proj(attn_output), k_rotate, v
 
 

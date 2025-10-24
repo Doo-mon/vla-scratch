@@ -6,7 +6,7 @@ from tensordict import TensorClass
 class Observation(TensorClass):
     images: at.Float[torch.Tensor, "*batch num_cam 3 height width"]
     image_masks: at.Bool[torch.Tensor, "*batch num_cam 1"]
-    state: at.Float[torch.Tensor, "*batch state_dim"]
+    state: at.Float[torch.Tensor, "*batch state_history state_dim"]
     tokenized_prompt: at.Int64[torch.Tensor, "*batch max_tokens"]
     tokenized_prompt_mask: at.Bool[torch.Tensor, "*batch max_tokens"]
 
