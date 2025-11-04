@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 from torch.utils.data import Dataset
 from vla_scratch.datasets.libero.common import *
+from vla_scratch.datasets.common import TASK_KEY
 from vla_scratch.datasets.libero.config import LiberoIPECConfig
 
 
@@ -14,11 +15,10 @@ class IPECDataset(Dataset):
         self,
         config: LiberoIPECConfig,
     ):
-        repo_id = Path(config.repo_id)
         self.action_horizon = action_horizon = config.action_horizon
         self.state_history = state_history = config.state_history
 
-        meta_data = LeRobotDatasetMetadata(repo_id)
+        meta_data = LeRobotDatasetMetadata(config.repo_id[0])
         fps = meta_data.fps
 
         delta_timestamps = {
@@ -35,19 +35,24 @@ class IPECDataset(Dataset):
                 / fps
             ).tolist(),
         }
-        self.lerobot_dataset = LeRobotDataset(
+        self.lerobot_datasets = [LeRobotDataset(
             repo_id=repo_id, delta_timestamps=delta_timestamps
-        )
-        assert fps == self.lerobot_dataset.fps
+        ) for repo_id in config.repo_id]
+        assert fps == self.lerobot_datasets[0].fps
+
+        self.idx_map = []
+        for dataset_idx, dataset in enumerate(self.lerobot_datasets):
+            for frame_in_dataset in range(dataset.num_frames):
+                self.idx_map.append((dataset_idx, frame_in_dataset))
 
     def __len__(self):
-        return len(self.lerobot_dataset)
+        return len(self.idx_map)
 
     def __getitem__(self, idx):
-        item = self.lerobot_dataset[idx]
-        full_state = item.pop("observation.state")
-        # shape: [state_history + action_horizon, state_dim]
+        dataset_idx, frame_in_dataset = self.idx_map[idx]
+        item = self.lerobot_datasets[dataset_idx][frame_in_dataset]
 
+        full_state = item.pop("observation.state")
         item[STATE_KEY] = full_state[: self.state_history + 1]
         # shape: [state_history + 1, state_dim]
         item[FUTURE_STATE_KEY] = full_state[self.state_history :]
@@ -76,10 +81,10 @@ def test_episode():
     for ep_idx in [1, 2, 4, 6, 8]:
         start_idx = episode_starts[ep_idx]
         end_idx = start_idx + episode_lengths[ep_idx]
-        tasks = episode_tasks[ep_idx][0]
+        task = episode_tasks[ep_idx][0]
         for idx in range(start_idx, end_idx):
             item = dataset[idx]
-            assert item["task"] == tasks
+            assert item["task"] == task
 
         print(f"Episode {ep_idx} passed task name check.")
         breakpoint()

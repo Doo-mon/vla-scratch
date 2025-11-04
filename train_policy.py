@@ -27,6 +27,7 @@ from tensordict import TensorDict
 
 import hydra
 from hydra.core.config_store import ConfigStore
+from hydra.conf import HydraConf, JobConf, RunDir
 from omegaconf import DictConfig, OmegaConf, MISSING
 
 from vla_scratch.datasets.config import DataConfig, create_dataset
@@ -34,7 +35,12 @@ from vla_scratch.policies.config import PolicyConfig, create_policy
 from vla_scratch.datasets.data_types import DataSample
 
 from vla_scratch.policies.pi.policy import PiPolicy
-from vla_scratch.policies.utils import get_beta_dist, sample_noise, sample_time, clip_grad_norm_
+from vla_scratch.policies.utils import (
+    get_beta_dist,
+    sample_noise,
+    sample_time,
+    clip_grad_norm_,
+)
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -50,8 +56,13 @@ class WandbCfg:
 @dataclass
 class TrainConfig:
     defaults: list[Any] = field(
-        default_factory=lambda: ["_self_", {"policy": "pi"}, {"data": "libero-ipec"}]
+        default_factory=lambda: [
+            "_self_",
+            {"policy": "pi"},
+            {"data": "libero-ipec"},
+        ]
     )
+
     # data loader
     num_workers: int = 8
     split_seed: int = 42
@@ -59,7 +70,7 @@ class TrainConfig:
     epochs: int = 20
     batch_size: int = 4
     grad_accum_steps: int = 1
-    lr: float = 3e-5
+    lr: float = 1e-4
     weight_decay: float = 1e-4
     optim_eps: float = 1e-8
     clip_grad_norm: float = 1.0
@@ -79,21 +90,35 @@ class TrainConfig:
     # wandb
     wandb: WandbCfg = field(default_factory=WandbCfg)
 
+    # Hydra behavior overrides
+    # - Do not change cwd automatically (job.chdir=False)
+    # - Do not create .hydra subdir (output_subdir=null)
+    # - Keep Hydra run dir as current directory (run.dir='.')
+    hydra: HydraConf = field(
+        default_factory=lambda: HydraConf(
+            job=JobConf(chdir=False),
+            output_subdir=None,
+            run=RunDir(dir="."),
+        )
+    )
+
 
 cs = ConfigStore.instance()
 cs.store(name="train", node=TrainConfig())
 
 
-def load_checkpoint(model: torch.nn.Module, checkpoint: str, device: torch.device) -> None:
+def load_checkpoint(
+    model: torch.nn.Module, checkpoint: str, device: torch.device
+) -> None:
     state_dict = torch.load(checkpoint, map_location=device)
     model_state_dict = state_dict["model"]
     missing, unexpected = model.load_state_dict(model_state_dict, strict=False)
     print("Checkpoint loaded.")
 
     if missing:
-        print(f"Paligemma checkpoint loaded with missing keys: {missing}")
+        print(f"checkpoint loaded with missing keys: {missing}")
     if unexpected:
-        print(f"Paligemma checkpoint loaded with unexpected keys: {unexpected}")
+        print(f"checkpoint loaded with unexpected keys: {unexpected}")
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -128,7 +153,8 @@ def setup_dist():
     try:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         dist.init_process_group(
-            backend="nccl", device_id=torch.device("cuda", local_rank)
+            backend="nccl",
+            device_id=torch.device("cuda", local_rank),
         )
         global_rank = dist.get_rank()
         world_size = dist.get_world_size()
@@ -142,9 +168,6 @@ def setup_dist():
 
 
 def create_dataloaders(train_cfg: TrainConfig, world_size: int, global_rank: int):
-    # train_cfg.data.dataset_kwargs = dict(train_cfg.data.dataset_kwargs or {})
-    # train_cfg.data.dataset_kwargs["action_horizon"] = train_cfg.policy.action_horizon
-    # train_cfg.data.dataset_kwargs["state_history"] = train_cfg.policy.state_history
     train_cfg.data.action_horizon = train_cfg.policy.action_horizon
     train_cfg.data.state_history = train_cfg.policy.state_history
 
@@ -241,7 +264,7 @@ def compute_sample_mse(
     for i in pbar:
         batch, _ = next(dataloader_iter)
         batch: DataSample = batch.to(device)
-        predicted_actions = model.forward(
+        predicted_actions = model(
             part="sample",
             observation=batch.observation,
             num_steps=num_sample_steps,
@@ -307,7 +330,7 @@ def main(cfg: DictConfig) -> None:
         )
 
     if world_size > 1:
-        # TODO: currently change to float32 for reduce type will make training very slow
+        # FSDP wrapping
         mixed_precision = MixedPrecision(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.bfloat16,
@@ -315,14 +338,12 @@ def main(cfg: DictConfig) -> None:
             cast_forward_inputs=True,
             cast_root_forward_inputs=True,
         )
-
         nproc_per_node = int(os.environ["LOCAL_WORLD_SIZE"])
         nnodes = world_size // nproc_per_node
         assert world_size == nproc_per_node * nnodes
         mesh = dist.device_mesh.init_device_mesh("cuda", (nnodes, nproc_per_node))
         # get the process group within a node
         pg = mesh.get_group(mesh_dim=1)
-
         model = FSDP(
             model,
             sharding_strategy=ShardingStrategy.HYBRID_SHARD,
@@ -332,12 +353,15 @@ def main(cfg: DictConfig) -> None:
             backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
             device_id=local_rank,
             sync_module_states=True,
+            use_orig_params=True,
+            limit_all_gathers=True,
         )
         print(f"Wrapped model in FSDP: global_rank={global_rank}")
 
+    global_batch_size = train_cfg.batch_size * train_cfg.grad_accum_steps * world_size
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=train_cfg.lr,
+        lr=train_cfg.lr / math.sqrt(global_batch_size),
         weight_decay=train_cfg.weight_decay,
         eps=train_cfg.optim_eps,
         foreach=False,
@@ -357,12 +381,19 @@ def main(cfg: DictConfig) -> None:
         run_idx = run.name.split("-")[-1]
         run.name = f"{run_idx}-{default_run_name}"
 
+        # save config
+        with open("train-cfg.yaml", "w") as f:
+            OmegaConf.save(cfg, f)
+        with open("policy-cfg.yaml", "w") as f:
+            OmegaConf.save(train_cfg.policy, f)
+        with open("data-cfg.yaml", "w") as f:
+            OmegaConf.save(train_cfg.data, f)
+
     time_dist = get_beta_dist(1.0, 1.5, device=device)
 
     global_step = 0
     last_time = time.perf_counter()
     for epoch in range(train_cfg.epochs):
-        data_loader_iter = iter(dataloader)
         if isinstance(dataloader.sampler, DistributedSampler):
             dataloader.sampler.set_epoch(epoch)
 
@@ -373,6 +404,7 @@ def main(cfg: DictConfig) -> None:
             pbar = tqdm(pbar, desc=f"Epoch {epoch+1}/{train_cfg.epochs}")
 
         model.train()
+        data_loader_iter = iter(dataloader)
         for i in pbar:
             torch.cuda.nvtx.range_push("Zero Grad")
             optimizer.zero_grad(set_to_none=True)
@@ -386,7 +418,7 @@ def main(cfg: DictConfig) -> None:
                 torch.cuda.nvtx.range_pop()
 
                 torch.cuda.nvtx.range_push("Model Encode Prefix")
-                _, prefix_pad_masks, prefix_key_values = model.forward(
+                _, prefix_pad_masks, prefix_key_values = model(
                     part="prefix",
                     observation=data_sample.observation,
                 )
@@ -421,7 +453,7 @@ def main(cfg: DictConfig) -> None:
                 torch.cuda.nvtx.range_pop()
 
                 torch.cuda.nvtx.range_push("Model Predict Suffix")
-                v_t = model.forward(
+                v_t = model(
                     part="suffix",
                     state=data_sample.observation.state,
                     prefix_pad_masks=prefix_pad_masks,
@@ -434,7 +466,7 @@ def main(cfg: DictConfig) -> None:
                 torch.cuda.nvtx.range_pop()
 
                 torch.cuda.nvtx.range_push("Loss Backward")
-                (loss / math.sqrt(train_cfg.grad_accum_steps)).backward()
+                (loss / train_cfg.grad_accum_steps).backward()
                 torch.cuda.nvtx.range_pop()
 
             torch.cuda.nvtx.range_push("Optimizer Step")

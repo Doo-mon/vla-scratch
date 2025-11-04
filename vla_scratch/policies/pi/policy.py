@@ -170,11 +170,11 @@ class PiPolicy(nn.Module):
             device=time.device,
             dtype=time.dtype,
         )
-        time_emb = self._apply_checkpoint(self.time_mlp.forward, time_emb)
+        time_emb = self._apply_checkpoint(self.time_mlp, time_emb)
 
-        action_emb = self._apply_checkpoint(self.action_in_proj.forward, noisy_actions)
+        action_emb = self._apply_checkpoint(self.action_in_proj, noisy_actions)
         if self.config.use_state:
-            state_emb = self._apply_checkpoint(self.state_in_proj.forward, state)
+            state_emb = self._apply_checkpoint(self.state_in_proj, state)
             suffix_emb = torch.cat([state_emb, action_emb], dim=1)
         else:
             suffix_emb = action_emb

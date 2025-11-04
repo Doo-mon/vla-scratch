@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Dict, Optional
 import importlib
+import re
 
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -17,6 +18,9 @@ from vla_scratch.datasets.transforms import (
 )
 from vla_scratch.datasets.transforms import Normalize, ToTensorClass
 from vla_scratch.policies.config import PolicyConfig
+import os
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 @dataclass
@@ -25,7 +29,7 @@ class DataConfig:
     action_horizon: Optional[int] = None
     state_history: Optional[int] = None
     transforms: List[Any] = field(default_factory=list)
-    norm_stats_path: Path | None = None
+    norm_stats_path: Optional[str] = None
 
 
 def _locate_class(target: str) -> type:
@@ -57,32 +61,64 @@ def _instantiate_transform(spec: Any) -> TransformFn:
     raise TypeError(f"Unsupported transform specification: {spec!r}")
 
 
+def _resolve_config_placeholders(
+    template: str | Path | None,
+    *,
+    data_cfg: "DataConfig",
+    policy_cfg: Optional["PolicyConfig"] = None,
+) -> Optional[str]:
+    """Resolve placeholders like '{data.attr}' or '{policy.attr}' in a string/Path.
+
+    - If `template` is None, returns None.
+    - If no placeholders are present, returns the string unchanged.
+    - Unknown placeholders are left untouched (only 'data.*' and 'policy.*' are resolved).
+    """
+    if template is None:
+        return None
+    s = str(template)
+
+    def _replace_data(match: re.Match[str]) -> str:
+        attr = match.group(1)
+        if not hasattr(data_cfg, attr):
+            # Leave as-is if attribute missing
+            return match.group(0)
+        return str(getattr(data_cfg, attr))
+
+    def _replace_policy(match: re.Match[str]) -> str:
+        if policy_cfg is None:
+            return match.group(0)
+        attr = match.group(1)
+        if not hasattr(policy_cfg, attr):
+            return match.group(0)
+        return str(getattr(policy_cfg, attr))
+
+    s = re.sub(r"\{data\.([a-zA-Z0-9_]+)\}", _replace_data, s)
+    s = re.sub(r"\{policy\.([a-zA-Z0-9_]+)\}", _replace_policy, s)
+    return s
+
+
 def create_dataset(
-    data_config: DataConfig,
-    policy_config: PolicyConfig,
+    data_cfg: DataConfig,
+    policy_cfg: PolicyConfig,
     *,
     skip_norm_stats: bool = False,
 ) -> TransformedDataset:
-    dataset_cls = _locate_class(data_config._target_)
-    base_dataset = dataset_cls(data_config)
+    dataset_cls = _locate_class(data_cfg._target_)
+    base_dataset = dataset_cls(data_cfg)
 
     transforms: List[TransformFn] = []
 
     dataset_transforms = [
-        _instantiate_transform(spec) for spec in data_config.transforms
+        _instantiate_transform(spec) for spec in data_cfg.transforms
     ]
     transforms.extend(dataset_transforms)
 
-    if not skip_norm_stats and data_config.norm_stats_path is not None:
-        import vla_scratch
-
-        repo_root = Path(vla_scratch.__file__).parents[1]
-        stats_path = repo_root / data_config.norm_stats_path
-        stats = load_norm_stats(stats_path)
+    if not skip_norm_stats and data_cfg.norm_stats_path is not None:
+        stats = load_norm_stats(data_cfg, policy_cfg)
         transforms.append(Normalize(norm_stats=stats))
 
     policy_transforms = [
-        _instantiate_transform(spec) for spec in policy_config.transforms
+        _instantiate_transform(spec) for spec in policy_cfg.transforms
     ]
     transforms.extend(policy_transforms)
     transforms.append(ToTensorClass())
@@ -100,6 +136,8 @@ def compute_and_save_norm_stats(
 ) -> NormStats:
     dataset = create_dataset(data_config, policy_config, skip_norm_stats=True)
     dataset_size = len(dataset)
+
+    dummy = dataset[0]  # to initialize any lazy components
 
     num_samples = min(num_samples, dataset_size)
     batch_size = min(batch_size, num_samples)
@@ -135,7 +173,7 @@ def compute_and_save_norm_stats(
         std = tensor.std(dim=0, unbiased=False)
         q01 = torch.quantile(tensor, 0.01, dim=0)
         q99 = torch.quantile(tensor, 0.99, dim=0)
-        return FieldNormStats(mean_=mean, std_=std, q01=q01, q99=q99)
+        return FieldNormStats(mean_=mean, std_=std, q01=q01, q99=q99, batch_size=tensor.shape[1:])
 
     stats = {
         PROCESSED_STATE_KEY: _compute_norm_stats_for_tensor(state_tensor),
@@ -148,21 +186,30 @@ def compute_and_save_norm_stats(
     import vla_scratch
 
     repo_root = Path(vla_scratch.__file__).parents[1]
-    stats_path = repo_root / data_config.norm_stats_path
+    stats_path_str = _resolve_config_placeholders(
+        data_config.norm_stats_path, data_cfg=data_config, policy_cfg=policy_config
+    )
+    stats_path = repo_root / str(stats_path_str)
     stats_path.parent.mkdir(parents=True, exist_ok=True)
     save_norm_stats(stats_path, stats)
     print(f"Saved normalization stats to: {stats_path}")
-    return stats
+    return stacked, stats
 
 
 if __name__ == "__main__":
     # Example usage
     from tensordict import TensorDict
     from vla_scratch.datasets.libero.config import LiberoIPECConfig
+    from vla_scratch.datasets.spirit.config import MozConfig
     from vla_scratch.policies.pi.config import PiConfig
 
     data_config = LiberoIPECConfig()
+    # data_config = MozConfig()
     policy_config = PiConfig()
+
+    policy_config.action_horizon = 30
+    policy_config.state_history = 10
+    
     data_config.action_horizon = policy_config.action_horizon
     data_config.state_history = policy_config.state_history
     batches, stats = compute_and_save_norm_stats(data_config, policy_config)
@@ -251,3 +298,5 @@ if __name__ == "__main__":
         action_stride = 1
         visualize_distribution(action_tensor, action_stats, "Action", action_stride)
         plt.savefig("action_distribution.png")
+    
+    visualize_distribution(batches, stats)

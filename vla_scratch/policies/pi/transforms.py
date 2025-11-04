@@ -9,6 +9,7 @@ from vla_scratch.datasets.transforms import TransformFn
 from vla_scratch.datasets.common import (
     PROCESSED_IMAGE_KEY,
     PROCESSED_IMAGE_MASK_KEY,
+    TASK_KEY,
     TOKENIZED_KEY,
     TOKENIZED_MASK_KEY,
 )
@@ -26,11 +27,22 @@ class PreprocessImage(TransformFn):
             mode="bilinear",
             align_corners=False,
         )
-        images = (images / 255. - 0.5) / 0.5
+        images = (images / 255.0 - 0.5) / 0.5
         sample[PROCESSED_IMAGE_KEY] = images
         if PROCESSED_IMAGE_MASK_KEY not in sample:
-            mask = torch.ones((images.shape[0], 1), dtype=torch.bool, device=images.device)
+            mask = torch.ones(
+                (images.shape[0], 1), dtype=torch.bool, device=images.device
+            )
             sample[PROCESSED_IMAGE_MASK_KEY] = mask
+        return sample
+
+
+class StructurePrompt(TransformFn):
+    """Format the task string into a language prompt."""
+
+    def compute(self, sample: Dict) -> Dict:
+        task_prompt: str = sample[TASK_KEY]
+        sample["prompt"] = f"<bos>Task: {task_prompt}; \n Action:"
         return sample
 
 
@@ -41,11 +53,11 @@ class TokenizePrompt(TransformFn):
         model_id: str,
         max_length: int = 256,
     ) -> None:
-        # processors = importlib.import_module("transformers")
-        # processor_cls = getattr(processors, processor_class)
-        # processor = processor_cls.from_pretrained(model_id)
-        from transformers import PaliGemmaProcessor
-        processor = PaliGemmaProcessor.from_pretrained(model_id)
+        processors = importlib.import_module("transformers")
+        processor_cls = getattr(processors, processor_class)
+        processor = processor_cls.from_pretrained(model_id)
+        # from transformers import PaliGemmaProcessor
+        # processor = PaliGemmaProcessor.from_pretrained(model_id)
         self.tokenizer = processor.tokenizer
         self.max_length = max_length
 

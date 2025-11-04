@@ -2,6 +2,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence, SupportsIndex, Tuple
 
+
 import jaxtyping as at
 import numpy as np
 import torch
@@ -17,6 +18,7 @@ from vla_scratch.datasets.common import (
     TOKENIZED_MASK_KEY,
 )
 from vla_scratch.datasets.data_types import ActionChunk, DataSample, Observation
+from vla_scratch.datasets.math_utils import scale_transform, unscale_transform
 
 
 class TransformFn:
@@ -107,9 +109,58 @@ class Normalize(TransformFn):
     def _normalize_quantile(
         tensor: torch.Tensor, stats: FieldNormStats
     ) -> torch.Tensor:
-        q01 = stats.q01
-        q99 = stats.q99
-        return ((tensor - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0).clamp(-1.5, 1.5)
+        normalized = scale_transform(tensor, stats.q01, stats.q99).clamp(-1.5, 1.5)
+        return normalized
+        # q01 = stats.q01
+        # q99 = stats.q99
+        # return ((tensor - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0).clamp(-1.5, 1.5)
+
+
+class DeNormalize(TransformFn):
+    def __init__(
+        self,
+        norm_stats: Dict[str, FieldNormStats],
+        *,
+        use_quantiles: bool = True,
+        strict: bool = False,
+    ) -> None:
+        self.norm_stats = norm_stats
+        self.use_quantiles = use_quantiles
+        self.strict = strict
+
+    def __repr__(self) -> str:
+        keys = ", ".join(sorted(self.norm_stats.keys()))
+        return (
+            f"{self.__class__.__name__}(keys=[{keys}], "
+            f"use_quantiles={self.use_quantiles}, strict={self.strict})"
+        )
+
+    def compute(self, sample: Dict) -> Dict:
+        denormalizer = self._denormalize_quantile if self.use_quantiles else self._denormalize
+        for key, stats in self.norm_stats.items():
+            if key not in sample:
+                if self.strict:
+                    raise KeyError(
+                        f"Normalization stats provided for '{key}' "
+                        "but the key is missing in the sample."
+                    )
+                continue
+            sample[key] = denormalizer(sample[key], stats)
+        return sample
+
+    @staticmethod
+    def _denormalize(tensor: torch.Tensor, stats: FieldNormStats) -> torch.Tensor:
+        mean = stats.mean_
+        std = stats.std_
+        return tensor.clamp(-1.5, 1.5) * (std + 1e-6) + mean
+
+    @staticmethod
+    def _denormalize_quantile(
+        tensor: torch.Tensor, stats: FieldNormStats
+    ) -> torch.Tensor:
+        result = unscale_transform(tensor.clamp(-1.5, 1.5), stats.q01, stats.q99)
+        return result
+
 
 
 class ToTensorClass(TransformFn):
@@ -118,7 +169,7 @@ class ToTensorClass(TransformFn):
     def compute(self, sample: Dict) -> DataSample:
         observation = Observation(
             images=sample[PROCESSED_IMAGE_KEY],
-            image_masks=sample.get(PROCESSED_IMAGE_MASK_KEY),
+            image_masks=sample[PROCESSED_IMAGE_MASK_KEY],
             state=sample[PROCESSED_STATE_KEY],
             tokenized_prompt=sample[TOKENIZED_KEY],
             tokenized_prompt_mask=sample[TOKENIZED_MASK_KEY],
@@ -127,9 +178,16 @@ class ToTensorClass(TransformFn):
         return DataSample(observation=observation, action_chunk=action)
 
 
-def load_norm_stats(path: Path) -> Dict[str, FieldNormStats]:
-    path = Path(path)
-    loaded = np.load(path, allow_pickle=True)
+def load_norm_stats(data_cfg: "DataConfig", policy_cfg: "PolicyConfig") -> Dict[str, FieldNormStats]:
+    import vla_scratch
+    from vla_scratch.datasets.config import _resolve_config_placeholders
+
+    repo_root = Path(vla_scratch.__file__).parents[1]
+    stats_path_str = _resolve_config_placeholders(
+        data_cfg.norm_stats_path, data_cfg=data_cfg, policy_cfg=policy_cfg
+    )
+    stats_path = repo_root / str(stats_path_str)
+    loaded = np.load(stats_path, allow_pickle=True)
     try:
         if hasattr(loaded, "files"):
             raw = {key: loaded[key] for key in loaded.files}

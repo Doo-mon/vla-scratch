@@ -25,6 +25,7 @@ def create_sinusoidal_pos_embedding(
     return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
 
 
+@torch.compile
 def make_att_2d_masks(
     pad_masks: at.Bool[torch.Tensor, "b n"],
     att_masks: at.Bool[torch.Tensor, "b n"],
@@ -60,6 +61,7 @@ def make_att_2d_masks(
     return att_2d_masks & pad_2d_masks
 
 
+@torch.compile
 def attention_fill_false_to_inf(
     att_mask: at.Bool[torch.Tensor, "b q n"],
 ) -> at.Float[torch.Tensor, "b q n"]:

@@ -39,6 +39,7 @@ dependencies = [
     "torchcodec>=0.5",
     "accelerate>=1.11.0",
     "mujoco>=3.3.7",
+    "viser>=1.0.15",
 ]
 
 [tool.uv.sources]

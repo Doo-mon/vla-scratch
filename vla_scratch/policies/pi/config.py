@@ -6,6 +6,9 @@ from vla_scratch.policies.config import PolicyConfig
 def _default_pi_transforms() -> list[Any]:
     return [
         {
+            "_target_": "vla_scratch.policies.pi.transforms.StructurePrompt",
+        },
+        {
             "_target_": "vla_scratch.policies.pi.transforms.TokenizePrompt",
             "processor_class": "PaliGemmaProcessor",
             "model_id": "google/paligemma-3b-mix-224",
