@@ -1,27 +1,34 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-import math
+import numpy as np
 import os
 import time
-from typing import Any, cast, Optional
+from typing import Any, cast, Optional, List, Tuple
 from tqdm import tqdm
 import wandb
 import datetime
 from setproctitle import setproctitle
+from functools import partial
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 import torch.distributed as dist
+import torch.distributed.tensor
 from torch.utils.data.distributed import DistributedSampler
-from torch.distributed.fsdp import (
-    BackwardPrefetch,
-    FullyShardedDataParallel as FSDP,
-    MixedPrecision,
-    ShardingStrategy,
+from torch.distributed.fsdp._fully_shard import (
+    fully_shard,
+    MixedPrecisionPolicy,
+    FSDPModule,
+    register_fsdp_forward_method,
 )
-from torch.distributed.checkpoint.state_dict import get_state_dict, StateDictOptions
+from torch.distributed.checkpoint.state_dict import (
+    get_state_dict,
+    StateDictOptions,
+    set_model_state_dict,
+    set_optimizer_state_dict,
+)
 
 from tensordict import TensorDict
 
@@ -35,14 +42,15 @@ from vla_scratch.policies.config import PolicyConfig, create_policy
 from vla_scratch.datasets.data_types import DataSample
 
 from vla_scratch.policies.pi.policy import PiPolicy
+from vla_scratch.utils import setup_dist, print_with_rank
 from vla_scratch.policies.utils import (
     get_beta_dist,
     sample_noise,
     sample_time,
-    clip_grad_norm_,
 )
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["FSDP_ENABLE_BACKWARD_HOOKS"] = "1"
 
 torch.set_float32_matmul_precision("high")
 
@@ -68,11 +76,14 @@ class TrainConfig:
     split_seed: int = 42
     # optimization
     epochs: int = 20
-    batch_size: int = 4
+    batch_size: int = 16
     grad_accum_steps: int = 1
-    lr: float = 1e-4
+
+    lr: float = 3e-6
+    betas: Tuple[float] = (0.99, 0.9999)
+    eps: float = 1e-8
     weight_decay: float = 1e-4
-    optim_eps: float = 1e-8
+
     clip_grad_norm: float = 1.0
     num_noise_per_sample: int = 8
     # logging and evaluation
@@ -108,17 +119,45 @@ cs.store(name="train", node=TrainConfig())
 
 
 def load_checkpoint(
-    model: torch.nn.Module, checkpoint: str, device: torch.device
+    model: torch.nn.Module,
+    checkpoint: str,
+    global_rank: int,
+    optimizer: Optional[torch.optim.Optimizer] = None,
 ) -> None:
-    state_dict = torch.load(checkpoint, map_location=device)
-    model_state_dict = state_dict["model"]
-    missing, unexpected = model.load_state_dict(model_state_dict, strict=False)
-    print("Checkpoint loaded.")
+    # Only rank 0 reads from disk; others pass empty dict and receive via broadcast
+    print_with_rank("Loading state dict from disk")
+    if global_rank == 0:
+        state_dict = torch.load(
+            checkpoint,
+            map_location="cpu",
+            mmap=True,
+            weights_only=False,
+        )
+        model_sd = state_dict.get("model", {})
+        optim_sd = state_dict.get("optimizer", {})
+    else:
+        model_sd = {}
+        optim_sd = {}
+    print_with_rank("Loaded state dict from disk!")
 
-    if missing:
-        print(f"checkpoint loaded with missing keys: {missing}")
-    if unexpected:
-        print(f"checkpoint loaded with unexpected keys: {unexpected}")
+    options = StateDictOptions(full_state_dict=True, broadcast_from_rank0=True)
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    set_model_state_dict(model=model, model_state_dict=model_sd, options=options)
+    print_with_rank("Set model state dict!")
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+    # Always call optimizer load on all ranks to keep collectives in sync
+    if optimizer is not None:
+        set_optimizer_state_dict(
+            model=model,
+            optimizers=optimizer,
+            optim_state_dict=optim_sd,
+            options=options,
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -143,28 +182,9 @@ def save_checkpoint(
             # "optimizer": optim_state_dict,
         }
         torch.save(full_state_dict, filename)
-        print(f"Saved checkpoint to {filename}")
+        print_with_rank(f"Saved checkpoint to {filename}")
 
 
-def setup_dist():
-    """
-    Initialize DDP process group
-    """
-    try:
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        dist.init_process_group(
-            backend="nccl",
-            device_id=torch.device("cuda", local_rank),
-        )
-        global_rank = dist.get_rank()
-        world_size = dist.get_world_size()
-    except ValueError:
-        local_rank = 0
-        global_rank = 0
-        world_size = 1
-    torch.cuda.set_device(local_rank)
-    os.environ["FSDP_ENABLE_BACKWARD_HOOKS"] = "1"
-    return local_rank, global_rank, world_size
 
 
 def create_dataloaders(train_cfg: TrainConfig, world_size: int, global_rank: int):
@@ -261,11 +281,12 @@ def compute_sample_mse(
     if global_rank == 0:
         pbar = tqdm(pbar, desc=f"Evaluating sample MSE")
     dataloader_iter = iter(dataloader)
+    if isinstance(model, FSDPModule):
+        model.unshard()
     for i in pbar:
         batch, _ = next(dataloader_iter)
         batch: DataSample = batch.to(device)
-        predicted_actions = model(
-            part="sample",
+        predicted_actions = model.sample_actions(
             observation=batch.observation,
             num_steps=num_sample_steps,
         )
@@ -277,6 +298,8 @@ def compute_sample_mse(
             reduction="none",
         )
         squared_errors.append(squared_error.mean())
+    if isinstance(model, FSDPModule):
+        model.reshard()
 
     return torch.stack(squared_errors).mean()
 
@@ -287,6 +310,10 @@ def main(cfg: DictConfig) -> None:
     OmegaConf.set_struct(cfg, False)
 
     train_cfg = cast(TrainConfig, OmegaConf.to_object(cfg))
+
+    # convert train_cfg.checkpoint_path to absolute path so after chdir 
+    if train_cfg.checkpoint_path is not None:
+        train_cfg.checkpoint_path = Path(train_cfg.checkpoint_path).resolve()
 
     # create timestamped output directory with exp_name
     now = datetime.datetime.now()
@@ -304,7 +331,7 @@ def main(cfg: DictConfig) -> None:
     local_rank, global_rank, world_size = setup_dist()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
-    print("create dataloaders...")
+    print_with_rank("create dataloaders...")
     (
         dataloader,
         eval_dataloader,
@@ -318,55 +345,88 @@ def main(cfg: DictConfig) -> None:
     train_cfg.policy.action_dim = action_dim
     train_cfg.policy.state_dim = state_dim
 
-    print("create model...")
+    print_with_rank("create model...")
     with torch.device(device):
+        # with (torch.device(device), torch.dtype(torch.bfloat16)):
         model: PiPolicy = create_policy(train_cfg.policy)
 
-    if local_rank == 0 and train_cfg.checkpoint_path is not None:
-        load_checkpoint(
-            model,
-            train_cfg.checkpoint_path,
-            device,
-        )
+    # Defer loading until after FSDP wrap so that DCP can shard+broadcast from rank 0
 
     if world_size > 1:
-        # FSDP wrapping
-        mixed_precision = MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-            buffer_dtype=torch.float32,
-            cast_forward_inputs=True,
-            cast_root_forward_inputs=True,
-        )
         nproc_per_node = int(os.environ["LOCAL_WORLD_SIZE"])
         nnodes = world_size // nproc_per_node
         assert world_size == nproc_per_node * nnodes
-        mesh = dist.device_mesh.init_device_mesh("cuda", (nnodes, nproc_per_node))
-        # get the process group within a node
-        pg = mesh.get_group(mesh_dim=1)
-        model = FSDP(
-            model,
-            sharding_strategy=ShardingStrategy.HYBRID_SHARD,
-            device_mesh=mesh,
-            cpu_offload=False,
-            mixed_precision=mixed_precision,
-            backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-            device_id=local_rank,
-            sync_module_states=True,
-            use_orig_params=True,
-            limit_all_gathers=True,
+        mesh = dist.device_mesh.init_device_mesh(
+            "cuda", (nnodes, nproc_per_node), mesh_dim_names=("node", "process")
         )
-        print(f"Wrapped model in FSDP: global_rank={global_rank}")
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            cast_forward_inputs=True,
+        )
+        for layer in model.paligemma.language_model.layers:
+            fully_shard(layer, mesh=mesh, mp_policy=mp_policy)
+            register_fsdp_forward_method(layer, model.gemma_custom_forward_name)
+        for block in model.gemma_expert.blocks:
+            fully_shard(block, mesh=mesh, mp_policy=mp_policy)
+
+        mp_policy_root = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.float32,
+            cast_forward_inputs=True,
+        )
+        fully_shard(model, mesh=mesh, mp_policy=mp_policy_root)
+        register_fsdp_forward_method(model, "encode_prefix")
+        register_fsdp_forward_method(model, "predict_suffix")
+        register_fsdp_forward_method(model, "sample_actions")
+
+        def set_forward_backward_prefetch(
+            layers: List[FSDPModule],
+            num_to_forward_prefetch: int,
+            num_to_backward_prefetch: int,
+        ) -> None:
+            for i, layer in enumerate(layers):
+                if i >= len(layers) - num_to_forward_prefetch:
+                    break
+                layers_to_prefetch = [
+                    layers[i + j] for j in range(1, num_to_forward_prefetch + 1)
+                ]
+                layer.set_modules_to_forward_prefetch(layers_to_prefetch)
+            for i, layer in enumerate(layers):
+                if i < num_to_backward_prefetch:
+                    continue
+                layers_to_prefetch = [
+                    layers[i - j] for j in range(1, num_to_backward_prefetch + 1)
+                ]
+                layer.set_modules_to_backward_prefetch(layers_to_prefetch)
+
+        set_forward_backward_prefetch(model.paligemma.language_model.layers, 2, 2)
+        set_forward_backward_prefetch(model.gemma_expert.blocks, 2, 2)
+
+        model: FSDPModule | PiPolicy
 
     global_batch_size = train_cfg.batch_size * train_cfg.grad_accum_steps * world_size
+    lr = np.clip(train_cfg.lr * np.sqrt(global_batch_size), max=3e-4)
+    betas = tuple(np.pow(beta, global_batch_size) for beta in train_cfg.betas)
+    eps = train_cfg.eps / np.sqrt(global_batch_size)
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=train_cfg.lr / math.sqrt(global_batch_size),
+        lr=lr,
+        betas=betas,
+        eps=eps,
         weight_decay=train_cfg.weight_decay,
-        eps=train_cfg.optim_eps,
         foreach=False,
         fused=True,
     )
+
+    if train_cfg.checkpoint_path is not None:
+        load_checkpoint(
+            model=model,
+            checkpoint=train_cfg.checkpoint_path,
+            global_rank=global_rank,
+            optimizer=optimizer,
+        )
 
     if global_rank == 0:
         run = wandb.init(
@@ -407,6 +467,7 @@ def main(cfg: DictConfig) -> None:
         data_loader_iter = iter(dataloader)
         for i in pbar:
             torch.cuda.nvtx.range_push("Zero Grad")
+            model.unshard()
             optimizer.zero_grad(set_to_none=True)
             torch.cuda.nvtx.range_pop()
 
@@ -418,8 +479,7 @@ def main(cfg: DictConfig) -> None:
                 torch.cuda.nvtx.range_pop()
 
                 torch.cuda.nvtx.range_push("Model Encode Prefix")
-                _, prefix_pad_masks, prefix_key_values = model(
-                    part="prefix",
+                _, prefix_pad_masks, prefix_key_values = model.encode_prefix(
                     observation=data_sample.observation,
                 )
                 torch.cuda.nvtx.range_pop()
@@ -453,8 +513,7 @@ def main(cfg: DictConfig) -> None:
                 torch.cuda.nvtx.range_pop()
 
                 torch.cuda.nvtx.range_push("Model Predict Suffix")
-                v_t = model(
-                    part="suffix",
+                v_t = model.predict_suffix(
                     state=data_sample.observation.state,
                     prefix_pad_masks=prefix_pad_masks,
                     prefix_key_values=prefix_key_values,
@@ -470,33 +529,17 @@ def main(cfg: DictConfig) -> None:
                 torch.cuda.nvtx.range_pop()
 
             torch.cuda.nvtx.range_push("Optimizer Step")
-            norm_before_clip = clip_grad_norm_(
-                model.parameters(),
-                max_norm=train_cfg.clip_grad_norm,
-                norm_type=2.0,
-                pg=pg if world_size > 1 else None,
+            norm_before_clip = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=train_cfg.clip_grad_norm
             )
             optimizer.step()
             torch.cuda.nvtx.range_pop()
 
-            data_stats_td = {
-                "data/observation.state.mean": data_sample.observation.state.mean().detach(),
-                "data/observation.state.std": data_sample.observation.state.std().detach(),
-                "data/observation.state.min": data_sample.observation.state.min().detach(),
-                "data/observation.state.max": data_sample.observation.state.max().detach(),
-                "data/observation.images.mean": data_sample.observation.images.mean().detach(),
-                "data/observation.images.std": data_sample.observation.images.std().detach(),
-                "data/observation.images.min": data_sample.observation.images.min().detach(),
-                "data/observation.images.max": data_sample.observation.images.max().detach(),
-                "data/action.mean": data_sample.action_chunk.actions.mean().detach(),
-                "data/action.std": data_sample.action_chunk.actions.std().detach(),
-                "data/action.min": data_sample.action_chunk.actions.min().detach(),
-                "data/action.max": data_sample.action_chunk.actions.max().detach(),
-            }
             log_td = {}
             log_td["loss/flow_mse"] = loss.detach()
-            log_td["loss/grad_norm"] = norm_before_clip.detach()
-            # log_td.update(data_stats_td)
+            if isinstance(norm_before_clip, torch.distributed.tensor.DTensor):
+                norm_before_clip = norm_before_clip.full_tensor()
+            log_td["loss/grad_norm"] = norm_before_clip
             log_td = TensorDict(log_td, [])
             log_td["loading"] = perf_dict.mean(dim=0)
 
@@ -532,8 +575,9 @@ def main(cfg: DictConfig) -> None:
                 # log train stats
                 log_td_stack: TensorDict = torch.stack(log_tds, dim=0)
                 if world_size > 1:
-                    for tensor in log_td_stack.values(leaves_only=True):
-                        dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
+                    log_td_stack.apply_(partial(dist.all_reduce, op=dist.ReduceOp.AVG))
+                    # for tensor in log_td_stack.values(leaves_only=True):
+                    #     dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
                 log_tds.clear()
                 log_td_mean: TensorDict = log_td_stack.type(torch.float32).mean(dim=0)
                 log_dict.update(

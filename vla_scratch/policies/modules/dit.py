@@ -368,7 +368,7 @@ class DiTModel(nn.Module):
             torch.cuda.nvtx.range_push(f"layer_{i}")
             if self.training:
                 hidden_states, k, v = torch.utils.checkpoint.checkpoint(
-                    layer.forward,
+                    layer,
                     hidden_states,
                     (cos, sin),
                     adarms_cond,
@@ -378,7 +378,7 @@ class DiTModel(nn.Module):
                     preserve_rng_state=False,
                 )
             else:
-                hidden_states, k, v = layer.forward(
+                hidden_states, k, v = layer(
                     hidden_states,
                     position_embeddings=(cos, sin),
                     adarms_cond=adarms_cond,

@@ -69,8 +69,7 @@ class LiberoState(TransformFn):
         pos_w = state_seq[:, 0:3]
         rotvec_seq = state_seq[:, 3:6]
         angle = torch.linalg.norm(rotvec_seq, dim=-1)
-        axis = rotvec_seq / (angle.unsqueeze(-1) + 1e-8)
-        quat_w = quat_from_angle_axis(angle, axis)
+        quat_w = quat_from_angle_axis(angle, rotvec_seq)
 
         current_pos_w = pos_w[-1]
         current_quat_w = quat_w[-1]
@@ -88,6 +87,25 @@ class LiberoState(TransformFn):
 
         history_grippers = state_seq[:history, 6:8]
         state_vec = torch.cat([history_dpos, history_dori6d, history_grippers], dim=-1)
+        sample[PROCESSED_STATE_KEY] = state_vec
+        return sample
+
+class LiberoGlobalState(TransformFn):
+    """Convert history of Libero states into global 6D pose."""
+
+    def compute(self, sample: Dict) -> Dict:
+        state_seq: torch.Tensor = sample[STATE_KEY][1:] # skip most old state
+
+        pos_w = state_seq[:, 0:3]
+
+        rotvec_seq = state_seq[:, 3:6]
+        angle = torch.linalg.norm(rotvec_seq, dim=-1)
+        quat_w = quat_from_angle_axis(angle, rotvec_seq)
+        ori6d_w = _rotation_matrix_to_6d(matrix_from_quat(quat_w))
+
+        grippers = state_seq[:, 6:8]
+
+        state_vec = torch.cat([pos_w, ori6d_w, grippers], dim=-1)
         sample[PROCESSED_STATE_KEY] = state_vec
         return sample
 

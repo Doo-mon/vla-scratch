@@ -20,7 +20,7 @@ def scale_transform(x: torch.Tensor, lower: torch.Tensor, upper: torch.Tensor) -
     # default value of center
     offset = (lower + upper) * 0.5
     # return normalized tensor
-    return 2 * (x - offset) / (upper - lower)
+    return 2 * (x - offset) / (upper - lower + 1e-6)
 
 
 @torch.jit.script

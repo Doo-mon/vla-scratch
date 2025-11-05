@@ -22,6 +22,62 @@ from vla_scratch.policies.utils import sample_noise
 from vla_scratch.policies.pi.config import PiConfig
 
 
+def _gemma_decoder_layer_custom_forward(
+    self, hidden_states, prefix_att_mask, position_embeddings
+):
+    """Custom forward for a GemmaDecoderLayer used in prefix encoding.
+
+    This mirrors the previous inline `compute_layer` function, but is defined
+    as a bound method that attaches to `GemmaDecoderLayer` as `custom_forward`.
+    """
+    # Local import to avoid hard dependency at module import time
+    from transformers.models.gemma.modeling_gemma import apply_rotary_pos_emb
+
+    torch.cuda.nvtx.range_push("input_layernorm")
+    pre_att = self.input_layernorm(hidden_states)
+    torch.cuda.nvtx.range_pop()
+
+    input_shape = hidden_states.shape[:-1]  # [batch_size, seq_len]
+    head_shape = (*input_shape, -1, self.self_attn.head_dim)
+
+    # attention
+    torch.cuda.nvtx.range_push("project_qkv")
+    q = self.self_attn.q_proj(pre_att).view(head_shape)
+    k = self.self_attn.k_proj(pre_att).view(head_shape)
+    v = self.self_attn.v_proj(pre_att).view(head_shape)
+    q = einops.rearrange(q, "b seq head dim -> b head seq dim")
+    k = einops.rearrange(k, "b seq head dim -> b head seq dim")
+    v = einops.rearrange(v, "b seq head dim -> b head seq dim")
+    torch.cuda.nvtx.range_pop()
+
+    torch.cuda.nvtx.range_push("rotary_embedding")
+    cos, sin = position_embeddings
+    q_rotate, k_rotate = apply_rotary_pos_emb(q, k, cos, sin)
+    torch.cuda.nvtx.range_pop()
+
+    torch.cuda.nvtx.range_push("attention")
+    out_att = F.scaled_dot_product_attention(
+        q_rotate,
+        k_rotate,
+        v,
+        attn_mask=prefix_att_mask,
+        scale=self.self_attn.scaling,
+    )
+    out_att = einops.rearrange(
+        out_att, "b head seq dim -> b seq (head dim)"
+    ).contiguous()
+    out_att = self.self_attn.o_proj(out_att)
+    res_att = hidden_states + out_att
+    torch.cuda.nvtx.range_pop()
+
+    torch.cuda.nvtx.range_push("mlp")
+    pre_mlp = self.post_attention_layernorm(res_att)
+    out_mlp = self.mlp(pre_mlp)
+    res_mlp = res_att + out_mlp
+    torch.cuda.nvtx.range_pop()
+    return res_mlp, (k_rotate, v)
+
+
 class PiPolicy(nn.Module):
     def __init__(self, config: PiConfig):
         super().__init__()
@@ -43,6 +99,17 @@ class PiPolicy(nn.Module):
         )
         end_time = time.time()
         print(f"PaliGemma model initialized in {end_time - start_time:.2f} seconds.")
+
+        # Bind our custom per-layer forward to Gemma decoder layers
+        from transformers.models.gemma.modeling_gemma import GemmaDecoderLayer
+
+        # Register once per process; safe to re-assign
+        self.gemma_custom_forward_name = "custom_forward"
+        setattr(
+            GemmaDecoderLayer,
+            self.gemma_custom_forward_name,
+            _gemma_decoder_layer_custom_forward,
+        )
 
         # number of hidden layers and head dim must match to do cross-attention at each layer
         vlm_hf_config = self.paligemma.config
@@ -213,8 +280,6 @@ class PiPolicy(nn.Module):
 
         from transformers.models.gemma.modeling_gemma import (
             GemmaModel,
-            GemmaDecoderLayer,
-            apply_rotary_pos_emb,
         )
 
         model: GemmaModel = self.paligemma.language_model
@@ -224,57 +289,15 @@ class PiPolicy(nn.Module):
         position_embeddings = model.rotary_emb.forward(prefix_embs, prefix_position_ids)
         torch.cuda.nvtx.range_pop()
 
-        def compute_layer(layer: GemmaDecoderLayer, hidden_states):
-            torch.cuda.nvtx.range_push(f"input_layernorm")
-            pre_att = layer.input_layernorm(hidden_states)
-            torch.cuda.nvtx.range_pop()
-
-            input_shape = hidden_states.shape[:-1]  # [batch_size, seq_len]
-            head_shape = (*input_shape, -1, layer.self_attn.head_dim)
-
-            # attention
-            torch.cuda.nvtx.range_push(f"project_qkv")
-            q = layer.self_attn.q_proj(pre_att).view(head_shape)  # .transpose(1, 2)
-            k = layer.self_attn.k_proj(pre_att).view(head_shape)  # .transpose(1, 2)
-            v = layer.self_attn.v_proj(pre_att).view(head_shape)  # .transpose(1, 2)
-            q = einops.rearrange(q, "b seq head dim -> b head seq dim")
-            k = einops.rearrange(k, "b seq head dim -> b head seq dim")
-            v = einops.rearrange(v, "b seq head dim -> b head seq dim")
-            torch.cuda.nvtx.range_pop()
-
-            torch.cuda.nvtx.range_push(f"rotary_embedding")
-            cos, sin = position_embeddings
-            q_rotate, k_rotate = apply_rotary_pos_emb(q, k, cos, sin)
-            torch.cuda.nvtx.range_pop()
-
-            torch.cuda.nvtx.range_push(f"attention")
-            out_att = F.scaled_dot_product_attention(
-                q_rotate,
-                k_rotate,
-                v,
-                attn_mask=prefix_att_mask,
-                scale=layer.self_attn.scaling,
-            )
-            out_att = einops.rearrange(
-                out_att, "b head seq dim -> b seq (head dim)"
-            ).contiguous()
-            out_att = layer.self_attn.o_proj(out_att)
-            res_att = hidden_states + out_att
-            torch.cuda.nvtx.range_pop()
-
-            torch.cuda.nvtx.range_push(f"mlp")
-            pre_mlp = layer.post_attention_layernorm(res_att)
-            out_mlp = layer.mlp(pre_mlp)
-            res_mlp = res_att + out_mlp
-            torch.cuda.nvtx.range_pop()
-            return res_mlp, (k_rotate, v)
-
         kv_cache_list: List[KVCache] = []
         for i, layer in enumerate(model.layers):
             # print(f"layer {i}: {hidden_states}")
             torch.cuda.nvtx.range_push(f"layer_{i}")
             hidden_states, (k, v) = self._apply_checkpoint(
-                compute_layer, layer, hidden_states
+                getattr(layer, self.gemma_custom_forward_name),
+                hidden_states,
+                prefix_att_mask,
+                position_embeddings,
             )
             torch.cuda.nvtx.range_pop()
 
@@ -353,15 +376,15 @@ class PiPolicy(nn.Module):
             time -= dt
         return x_t
 
-    def forward(self, part: Literal["prefix", "suffix", "sample"], *args, **kwargs):
-        if part == "prefix":
-            return self.encode_prefix(*args, **kwargs)
-        elif part == "suffix":
-            return self.predict_suffix(*args, **kwargs)
-        elif part == "sample":
-            return self.sample_actions(*args, **kwargs)
-        else:
-            raise ValueError(f"Unknown part: {part}")
+    # def forward(self, part: Literal["prefix", "suffix", "sample"], *args, **kwargs):
+    #     if part == "prefix":
+    #         return self.encode_prefix(*args, **kwargs)
+    #     elif part == "suffix":
+    #         return self.predict_suffix(*args, **kwargs)
+    #     elif part == "sample":
+    #         return self.sample_actions(*args, **kwargs)
+    #     else:
+    #         raise ValueError(f"Unknown part: {part}")
 
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
