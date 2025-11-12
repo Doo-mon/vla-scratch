@@ -37,6 +37,9 @@ class PiConfig(PolicyConfig):
 
     use_state: bool = True
 
+    num_obs_registers: int = 0
+    expert_only_use_register: bool = False
+
 
 Cs = ConfigStore.instance()
 Cs.store(name="pi", node=PiConfig, group="policy")

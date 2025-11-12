@@ -59,6 +59,7 @@ torch.set_float32_matmul_precision("high")
 class WandbCfg:
     project: str = "vla-scratch"
     mode: str = "disabled"
+    tags: List[str] = field(default_factory=lambda: [])
 
 
 @dataclass
@@ -73,11 +74,14 @@ class TrainConfig:
 
     # data loader
     num_workers: int = 8
+    prefetch_factor: int = 6
     split_seed: int = 42
     # optimization
     epochs: int = 20
     batch_size: int = 16
     grad_accum_steps: int = 1
+
+    detach_kv_cache: bool = False
 
     lr: float = 3e-6
     betas: Tuple[float] = (0.99, 0.9999)
@@ -90,8 +94,11 @@ class TrainConfig:
     exp_name: str = "pi-training"
     log_interval: int = 32
     eval_interval: int = 512
-    eval_fraction: float = 0.01
+    eval_fraction: float = 0.003
     eval_num_sample_steps: int = 10
+    # LR scheduling: start cosine anneal from the last N epochs
+    # Set to 0 to disable cosine annealing
+    cosine_anneal_epoch: int = 0
 
     # data
     data: DataConfig = MISSING
@@ -100,6 +107,10 @@ class TrainConfig:
     checkpoint_path: Optional[str] = None
     # wandb
     wandb: WandbCfg = field(default_factory=WandbCfg)
+
+    # FSDP communication precision for gradient reductions
+    # Options: "fp32" (default, safest), "bf16", "fp16"
+    fsdp_reduce_dtype: str = "fp32"
 
     # Hydra behavior overrides
     # - Do not change cwd automatically (job.chdir=False)
@@ -141,12 +152,9 @@ def load_checkpoint(
     print_with_rank("Loaded state dict from disk!")
 
     options = StateDictOptions(full_state_dict=True, broadcast_from_rank0=True)
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
+    # set_model_state_dict is collective-aware and will synchronize as needed
     set_model_state_dict(model=model, model_state_dict=model_sd, options=options)
     print_with_rank("Set model state dict!")
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
 
     # Always call optimizer load on all ranks to keep collectives in sync
     if optimizer is not None:
@@ -156,8 +164,6 @@ def load_checkpoint(
             optim_state_dict=optim_sd,
             options=options,
         )
-        if dist.is_available() and dist.is_initialized():
-            dist.barrier()
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -195,6 +201,11 @@ def create_dataloaders(train_cfg: TrainConfig, world_size: int, global_rank: int
         train_cfg.data,
         train_cfg.policy,
     )
+
+    # full_dataset = torch.utils.data.Subset(
+    #     full_dataset,
+    #     list(range(0, len(full_dataset), 100)),
+    # )
 
     if not (0.0 < train_cfg.eval_fraction < 1.0):
         raise ValueError("eval_fraction must be within (0, 1).")
@@ -245,7 +256,7 @@ def create_dataloaders(train_cfg: TrainConfig, world_size: int, global_rank: int
             collate_fn=collate_fn,
         )
         if train_cfg.num_workers > 0:
-            loader_kwargs["prefetch_factor"] = 4
+            loader_kwargs["prefetch_factor"] = train_cfg.prefetch_factor
         if sampler is not None:
             loader_kwargs["sampler"] = sampler
         else:
@@ -273,12 +284,12 @@ def compute_sample_mse(
     dataloader: DataLoader,
     device: torch.device,
     num_sample_steps: int,
-    global_rank: int,
+    local_rank: int,
 ) -> torch.Tensor:
     squared_errors = []
 
     pbar = range(len(dataloader))
-    if global_rank == 0:
+    if local_rank == 0:
         pbar = tqdm(pbar, desc=f"Evaluating sample MSE")
     dataloader_iter = iter(dataloader)
     if isinstance(model, FSDPModule):
@@ -356,12 +367,29 @@ def main(cfg: DictConfig) -> None:
         nproc_per_node = int(os.environ["LOCAL_WORLD_SIZE"])
         nnodes = world_size // nproc_per_node
         assert world_size == nproc_per_node * nnodes
-        mesh = dist.device_mesh.init_device_mesh(
-            "cuda", (nnodes, nproc_per_node), mesh_dim_names=("node", "process")
-        )
+        if nnodes > 1:
+            mesh = dist.device_mesh.init_device_mesh(
+                "cuda", (nnodes, nproc_per_node), mesh_dim_names=("node", "process")
+            )
+        else:
+            # Single node: prefer a simple 1D mesh to avoid backend split_group requirements
+            mesh = dist.device_mesh.init_device_mesh(
+                "cuda", (world_size,), mesh_dim_names=("process",)
+            )
+        # Map user-configured reduce dtype
+        _rd_map = {
+            "fp32": torch.float32,
+            "float32": torch.float32,
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+            "fp16": torch.float16,
+            "float16": torch.float16,
+        }
+        _reduce_dtype = _rd_map.get(str(train_cfg.fsdp_reduce_dtype).lower(), torch.float32)
+
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
+            reduce_dtype=_reduce_dtype,
             cast_forward_inputs=True,
         )
         for layer in model.paligemma.language_model.layers:
@@ -372,7 +400,7 @@ def main(cfg: DictConfig) -> None:
 
         mp_policy_root = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
+            reduce_dtype=_reduce_dtype,
             output_dtype=torch.float32,
             cast_forward_inputs=True,
         )
@@ -407,7 +435,7 @@ def main(cfg: DictConfig) -> None:
         model: FSDPModule | PiPolicy
 
     global_batch_size = train_cfg.batch_size * train_cfg.grad_accum_steps * world_size
-    lr = np.clip(train_cfg.lr * np.sqrt(global_batch_size), max=3e-4)
+    lr = min(float(train_cfg.lr * np.sqrt(global_batch_size)), 3e-4)
     betas = tuple(np.pow(beta, global_batch_size) for beta in train_cfg.betas)
     eps = train_cfg.eps / np.sqrt(global_batch_size)
     optimizer = torch.optim.AdamW(
@@ -432,6 +460,7 @@ def main(cfg: DictConfig) -> None:
         run = wandb.init(
             project=train_cfg.wandb.project,
             mode=train_cfg.wandb.mode,
+            tags=train_cfg.wandb.tags,
         )
         run.config.update(OmegaConf.to_container(cfg))
 
@@ -452,17 +481,39 @@ def main(cfg: DictConfig) -> None:
     time_dist = get_beta_dist(1.0, 1.5, device=device)
 
     global_step = 0
+    # Prepare cosine annealing scheduler, activated from last N epochs
+    scheduler = None
+    # steps per epoch equals number of optimizer steps per epoch
+    steps_per_epoch = max(1, len(dataloader) // train_cfg.grad_accum_steps)
     last_time = time.perf_counter()
     for epoch in range(train_cfg.epochs):
+        # Initialize cosine annealing at the start of the first scheduled epoch
+        if (
+            scheduler is None
+            and train_cfg.cosine_anneal_epoch > 0
+            and epoch >= max(0, train_cfg.epochs - train_cfg.cosine_anneal_epoch)
+        ):
+            # Number of remaining optimizer steps including this epoch
+            remaining_epochs = train_cfg.epochs - epoch
+            cosine_steps = max(1, steps_per_epoch * remaining_epochs)
+            # Start cosine anneal from current LR down to 1e-7 by training end
+            from torch.optim.lr_scheduler import CosineAnnealingLR
+
+            scheduler = CosineAnnealingLR(
+                optimizer,
+                T_max=cosine_steps,
+                eta_min=1e-7,
+            )
         if isinstance(dataloader.sampler, DistributedSampler):
             dataloader.sampler.set_epoch(epoch)
 
         log_tds = []
 
         pbar = range(len(dataloader) // train_cfg.grad_accum_steps)
-        if global_rank == 0:
+        if local_rank == 0:
             pbar = tqdm(pbar, desc=f"Epoch {epoch+1}/{train_cfg.epochs}")
 
+        # No global barrier here; let the step naturally synchronize on collectives
         model.train()
         data_loader_iter = iter(dataloader)
         for i in pbar:
@@ -504,6 +555,13 @@ def main(cfg: DictConfig) -> None:
                 ]
                 torch.cuda.nvtx.range_pop()
 
+                if train_cfg.detach_kv_cache:
+                    torch.cuda.nvtx.range_push("Detach KV Cache")
+                    prefix_key_values = [
+                        (k.detach(), v.detach()) for k, v in prefix_key_values
+                    ]
+                    torch.cuda.nvtx.range_pop()
+
                 torch.cuda.nvtx.range_push("Noise Sampling")
                 actions = data_sample.action_chunk.actions
                 noise = sample_noise(actions.shape, device, dtype=actions.dtype)
@@ -533,6 +591,9 @@ def main(cfg: DictConfig) -> None:
                 model.parameters(), max_norm=train_cfg.clip_grad_norm
             )
             optimizer.step()
+            # Step LR scheduler if enabled
+            if scheduler is not None:
+                scheduler.step()
             torch.cuda.nvtx.range_pop()
 
             log_td = {}
@@ -572,60 +633,76 @@ def main(cfg: DictConfig) -> None:
                 log_dict["perf/fps"] = fps
                 log_dict["perf/fps.total"] = fps * world_size
 
-                # log train stats
+                # log train stats (aggregate deterministically with a single all_reduce)
                 log_td_stack: TensorDict = torch.stack(log_tds, dim=0)
-                if world_size > 1:
-                    log_td_stack.apply_(partial(dist.all_reduce, op=dist.ReduceOp.AVG))
-                    # for tensor in log_td_stack.values(leaves_only=True):
-                    #     dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
                 log_tds.clear()
                 log_td_mean: TensorDict = log_td_stack.type(torch.float32).mean(dim=0)
-                log_dict.update(
-                    log_td_mean.flatten_keys(separator="/").to_dict(
-                        convert_tensors=True
+
+                if world_size > 1:
+                    # Flatten keys to a stable, sorted order and pack into a single vector
+                    flat_td = log_td_mean.flatten_keys(separator="/")
+                    flat_dict = flat_td.to_dict()
+                    keys_sorted = sorted(flat_dict.keys())
+
+                    vec = torch.stack(
+                        [
+                            flat_dict[k].detach().reshape(1).to(device, dtype=torch.float32)
+                            for k in keys_sorted
+                        ],
+                        dim=0,
+                    ).squeeze(-1)
+
+                    # One-shot all-reduce over the packed metrics vector (synchronizes ranks)
+                    dist.all_reduce(vec, op=dist.ReduceOp.AVG)
+
+                    agg_values = vec.detach().cpu().tolist()
+                    log_dict.update({k: float(agg_values[i]) for i, k in enumerate(keys_sorted)})
+                else:
+                    log_dict.update(
+                        log_td_mean.flatten_keys(separator="/").to_dict(
+                            convert_tensors=True
+                        )
                     )
-                )
 
                 if global_step % train_cfg.eval_interval == 0:
-                    if world_size > 1:
-                        dist.barrier()
+                    # No pre-barrier; evaluation collectives below will synchronize
                     model.eval()
                     subtrain_mse = compute_sample_mse(
                         model=model,
                         dataloader=subtrain_dataloader,
                         device=device,
                         num_sample_steps=train_cfg.eval_num_sample_steps,
-                        global_rank=global_rank,
+                        local_rank=local_rank,
                     )
                     eval_mse = compute_sample_mse(
                         model=model,
                         dataloader=eval_dataloader,
                         device=device,
                         num_sample_steps=train_cfg.eval_num_sample_steps,
-                        global_rank=global_rank,
+                        local_rank=local_rank,
                     )
                     if world_size > 1:
+                        # All-reduces synchronize ranks; extra barriers not required
                         dist.all_reduce(subtrain_mse, op=dist.ReduceOp.AVG)
                         dist.all_reduce(eval_mse, op=dist.ReduceOp.AVG)
-                        dist.barrier()
                     log_dict["loss/sample_mse-train"] = subtrain_mse.item()
                     log_dict["loss/sample_mse-eval"] = eval_mse.item()
                     model.train()
 
+                log_string = "\n".join(
+                    [
+                        (
+                            f"{key}={value:.6f}"
+                            if isinstance(value, float)
+                            else f"{key}={value}"
+                        )
+                        for key, value in log_dict.items()
+                    ]
+                )
+                if local_rank == 0:
+                    print(log_string)
                 if global_rank == 0:
                     run.log(log_dict)
-                    # print(log_dict)
-                    log_string = "\n".join(
-                        [
-                            (
-                                f"{key}={value:.6f}"
-                                if isinstance(value, float)
-                                else f"{key}={value}"
-                            )
-                            for key, value in log_dict.items()
-                        ]
-                    )
-                    print(log_string)
 
         save_checkpoint(model, optimizer, global_rank, f"checkpoint_{epoch+1}.pth")
 

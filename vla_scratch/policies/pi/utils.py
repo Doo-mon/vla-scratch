@@ -1,6 +1,7 @@
 import torch
 import jaxtyping as at
 
+@torch.compile
 def create_sinusoidal_pos_embedding(
     time: at.Float[torch.Tensor, "b"],
     dimension: int,

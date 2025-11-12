@@ -36,6 +36,7 @@ from vla_scratch.datasets.libero.transforms import (
 )
 from vla_scratch.datasets.libero.common import STATE_KEY
 
+from vla_scratch.serving.zmq_policy_server import ZmqPolicyServer
 from vla_scratch.serving.websocket_policy_server import WebsocketPolicyServer
 from vla_scratch.serving.transforms import ToTorch, ToNumpy, ToObservation
 
@@ -138,9 +139,7 @@ class ReplayPolicy:
         return output
 
     def reset(self) -> None:
-        for input_transform in self._input_transforms:
-            if isinstance(input_transform, CatHistory):
-                input_transform.buffer.clear()
+        self._counter = 0
 
 
 def _find_latest_checkpoint(
@@ -322,9 +321,8 @@ def main(cfg: DictConfig) -> None:
         policy.infer(observation_in)
         policy.reset()
 
-    server = WebsocketPolicyServer(
-        policy=policy, host=serve_cfg.host, port=serve_cfg.port, metadata=metadata
-    )
+    server = ZmqPolicyServer(policy=policy, host=serve_cfg.host, port=serve_cfg.port, metadata=metadata)
+    # server = WebsocketPolicyServer(policy=policy, host=serve_cfg.host, port=serve_cfg.port, metadata=metadata)
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)

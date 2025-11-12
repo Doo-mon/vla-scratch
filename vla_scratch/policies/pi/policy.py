@@ -111,6 +111,23 @@ class PiPolicy(nn.Module):
             _gemma_decoder_layer_custom_forward,
         )
 
+        self.use_obs_register = config.num_obs_registers > 0
+        if self.use_obs_register:
+            # add a learnable token to the paligemma model for observation register
+            self.obs_registers = nn.Parameter(
+                torch.zeros(config.num_obs_registers, self.paligemma.config.hidden_size)
+            )
+            self.obs_registers_pad_masks = torch.ones(
+                config.num_obs_registers, dtype=torch.bool
+            )
+            self.obs_registers_att_masks = torch.zeros(
+                config.num_obs_registers, dtype=torch.bool
+            )
+        else:
+            assert not config.expert_only_use_register, (
+                "expert_only_use_register is set to True but num_obs_registers is 0."
+            )
+
         # number of hidden layers and head dim must match to do cross-attention at each layer
         vlm_hf_config = self.paligemma.config
         action_expert_config = get_config(config.action_expert_variant)
@@ -208,6 +225,24 @@ class PiPolicy(nn.Module):
         att_masks.append(
             torch.zeros(lang_emb.shape[1], dtype=torch.bool, device=lang_emb.device)
         )
+
+        if self.use_obs_register:
+            torch.cuda.nvtx.range_push("obs_register_embedding")
+            bsize = images.shape[0]
+            obs_tokens = einops.repeat(
+                self.obs_registers,
+                "s hidden_dim -> b s hidden_dim",
+                b=bsize,
+            )
+            obs_token_pad_masks = einops.repeat(
+                self.obs_registers_pad_masks,
+                "s -> b s",
+                b=bsize,
+            )
+            embs.append(obs_tokens)
+            pad_masks.append(obs_token_pad_masks)
+            att_masks.append(self.obs_registers_att_masks)
+            torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("concat_embeddings")
         embs = torch.cat(embs, dim=1)
@@ -314,7 +349,7 @@ class PiPolicy(nn.Module):
         noisy_actions,
         time,
     ):
-        """Apply one denoising step of the noise `x_t` at a given timestep."""
+        """Apply one denoising step of `noisy_actions` at a given timestep."""
         torch.cuda.nvtx.range_push("embed_suffix")
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
             self.embed_suffix(state, noisy_actions, time)
@@ -329,6 +364,20 @@ class PiPolicy(nn.Module):
         full_att_mask = attention_fill_false_to_inf(full_att_2d_mask)[:, None, :, :]
         # shape: [batch_size, 1, suffix_len, prefix_len + suffix_len]
         torch.cuda.nvtx.range_pop()
+
+        # only use the last num_obs_registers tokens from the prefix for the expert
+        if self.config.expert_only_use_register:
+            torch.cuda.nvtx.range_push("select_obs_registers")
+            num_registers = self.config.num_obs_registers
+            prefix_key_values = [
+                (
+                    kv[0][..., -num_registers:, :],
+                    kv[1][..., -num_registers:, :],
+                )
+                for kv in prefix_key_values
+            ]
+            full_att_mask = full_att_mask[..., -(num_registers + suffix_len) :]
+            torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("position_ids")
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]

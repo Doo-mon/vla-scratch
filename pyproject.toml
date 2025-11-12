@@ -29,13 +29,13 @@ dependencies = [
     "pillow",
     "setuptools",
     # serve policy
-    "websockets",
+    "pyzmq",
     "msgpack",
     "pdbpp",
     "datasets",
     "jsonlines>=4.0.0",
     "matplotlib>=3.9.4",
-    "lerobot",
+    "lerobot @ git+https://github.com/huggingface/lerobot@d602e8169cbad9e93a4a3b3ee1dd8b332af7ebf8",
     "torchcodec>=0.5",
     "accelerate>=1.11.0",
     "mujoco>=3.3.7",
@@ -43,8 +43,8 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-# lerobot = { git = "https://github.com/huggingface/lerobot", rev = "d602e8169cbad9e93a4a3b3ee1dd8b332af7ebf8" }
-lerobot = { path = "../lerobot" }
+lerobot = { git = "https://github.com/huggingface/lerobot", rev = "d602e8169cbad9e93a4a3b3ee1dd8b332af7ebf8" }
+# lerobot = { path = "../lerobot" }
 
 [tool.setuptools.packages.find]
 where = ["."]
