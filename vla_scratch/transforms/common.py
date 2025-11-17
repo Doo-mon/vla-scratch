@@ -8,8 +8,7 @@ from vla_scratch.transforms.data_keys import (
     PROCESSED_IMAGE_KEY,
     PROCESSED_IMAGE_MASK_KEY,
     PROCESSED_STATE_KEY,
-    TOKENIZED_KEY,
-    TOKENIZED_MASK_KEY,
+    TASK_KEY,
 )
 from vla_scratch.transforms.data_types import ActionChunk, Observation, DataSample
 from vla_scratch.transforms.base import TransformFn
@@ -21,8 +20,7 @@ class ToDataSample(TransformFn):
             images=sample[PROCESSED_IMAGE_KEY],
             image_masks=sample[PROCESSED_IMAGE_MASK_KEY],
             state=sample[PROCESSED_STATE_KEY],
-            tokenized_prompt=sample[TOKENIZED_KEY],
-            tokenized_prompt_mask=sample[TOKENIZED_MASK_KEY],
+            task=sample[TASK_KEY],
         )
         action = ActionChunk(actions=sample[PROCESSED_ACTION_KEY])
         return DataSample(observation=observation, action_chunk=action)
@@ -34,8 +32,7 @@ class ToObservation(TransformFn):
             images=sample[PROCESSED_IMAGE_KEY],
             image_masks=sample[PROCESSED_IMAGE_MASK_KEY],
             state=sample[PROCESSED_STATE_KEY],
-            tokenized_prompt=sample[TOKENIZED_KEY],
-            tokenized_prompt_mask=sample[TOKENIZED_MASK_KEY],
+            task=sample[TASK_KEY],
         )
 
 

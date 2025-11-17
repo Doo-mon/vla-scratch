@@ -1,18 +1,16 @@
-import math
 import jaxtyping as at
 import einops
 import time
-from typing import List, Tuple, Literal
+from typing import List, Tuple
 
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 from vla_scratch.transforms.data_types import Observation
 from vla_scratch.policies.data_types import *
-from vla_scratch.policies.modules.dit import DiTModel, get_config
+from vla_scratch.policies.modules.dit import DiTModel
 from vla_scratch.policies.pi.utils import (
     make_att_2d_masks,
     attention_fill_false_to_inf,
@@ -20,62 +18,10 @@ from vla_scratch.policies.pi.utils import (
 )
 from vla_scratch.policies.utils import sample_noise
 from vla_scratch.policies.pi.config import PiConfig
-
-
-def _gemma_decoder_layer_custom_forward(
-    self, hidden_states, prefix_att_mask, position_embeddings
-):
-    """Custom forward for a GemmaDecoderLayer used in prefix encoding.
-
-    This mirrors the previous inline `compute_layer` function, but is defined
-    as a bound method that attaches to `GemmaDecoderLayer` as `custom_forward`.
-    """
-    # Local import to avoid hard dependency at module import time
-    from transformers.models.gemma.modeling_gemma import apply_rotary_pos_emb
-
-    torch.cuda.nvtx.range_push("input_layernorm")
-    pre_att = self.input_layernorm(hidden_states)
-    torch.cuda.nvtx.range_pop()
-
-    input_shape = hidden_states.shape[:-1]  # [batch_size, seq_len]
-    head_shape = (*input_shape, -1, self.self_attn.head_dim)
-
-    # attention
-    torch.cuda.nvtx.range_push("project_qkv")
-    q = self.self_attn.q_proj(pre_att).view(head_shape)
-    k = self.self_attn.k_proj(pre_att).view(head_shape)
-    v = self.self_attn.v_proj(pre_att).view(head_shape)
-    q = einops.rearrange(q, "b seq head dim -> b head seq dim")
-    k = einops.rearrange(k, "b seq head dim -> b head seq dim")
-    v = einops.rearrange(v, "b seq head dim -> b head seq dim")
-    torch.cuda.nvtx.range_pop()
-
-    torch.cuda.nvtx.range_push("rotary_embedding")
-    cos, sin = position_embeddings
-    q_rotate, k_rotate = apply_rotary_pos_emb(q, k, cos, sin)
-    torch.cuda.nvtx.range_pop()
-
-    torch.cuda.nvtx.range_push("attention")
-    out_att = F.scaled_dot_product_attention(
-        q_rotate,
-        k_rotate,
-        v,
-        attn_mask=prefix_att_mask,
-        scale=self.self_attn.scaling,
-    )
-    out_att = einops.rearrange(
-        out_att, "b head seq dim -> b seq (head dim)"
-    ).contiguous()
-    out_att = self.self_attn.o_proj(out_att)
-    res_att = hidden_states + out_att
-    torch.cuda.nvtx.range_pop()
-
-    torch.cuda.nvtx.range_push("mlp")
-    pre_mlp = self.post_attention_layernorm(res_att)
-    out_mlp = self.mlp(pre_mlp)
-    res_mlp = res_att + out_mlp
-    torch.cuda.nvtx.range_pop()
-    return res_mlp, (k_rotate, v)
+from vla_scratch.policies.pi.vlm_bridge import (
+    PaligemmaBridge,
+    Qwen3VLBridge,
+)
 
 
 class PiPolicy(nn.Module):
@@ -90,37 +36,27 @@ class PiPolicy(nn.Module):
             )
 
         start_time = time.time()
-        from transformers import PaliGemmaForConditionalGeneration
+        # Build a bridge wrapper for this VLM; wrappers instantiate models internally
+        # if "PaliGemma" in config.vlm_type:
+        if config.vlm_type == "PaliGemmaForConditionalGeneration":
+            self.vlm_bridge = PaligemmaBridge(model_id=config.model_id, vlm_type=config.vlm_type, max_length=config.max_prompt_length)
+            # Keep attribute for backward compatibility
+            self.paligemma = self.vlm_bridge.model
+        elif config.vlm_type == "Qwen3VLForConditionalGeneration":
+            self.vlm_bridge = Qwen3VLBridge(model_id=config.model_id, vlm_type=config.vlm_type, max_length=config.max_prompt_length)
+        else:
+            raise NotImplementedError(f"Unsupported VLM type for PiPolicy: {config.vlm_type}")
 
-        self.paligemma = PaliGemmaForConditionalGeneration.from_pretrained(
-            config.model_id,
-            trust_remote_code=True,
-            device_map=torch.cuda.current_device(),
-        )
-        # from transformers import PaliGemmaConfig
-
-        # hf_config = PaliGemmaConfig.from_pretrained(config.model_id)
-        # self.paligemma = PaliGemmaForConditionalGeneration(hf_config)
         end_time = time.time()
-        print(f"PaliGemma model initialized in {end_time - start_time:.2f} seconds.")
+        print(f"VLM model initialized in {end_time - start_time:.2f} seconds: {config.vlm_type}")
 
-        # Bind our custom per-layer forward to Gemma decoder layers
-        from transformers.models.gemma.modeling_gemma import GemmaDecoderLayer
-
-        # Register once per process; safe to re-assign
-        self.gemma_custom_forward_name = "custom_forward"
-        setattr(
-            GemmaDecoderLayer,
-            self.gemma_custom_forward_name,
-            _gemma_decoder_layer_custom_forward,
-        )
+        # number of hidden layers and head dim must match to do cross-attention at each layer
+        text_layers, text_head_dim, text_num_kv_heads, vlm_hidden_size = self.vlm_bridge.get_text_dims()
 
         self.use_obs_register = config.num_obs_registers > 0
         if self.use_obs_register:
-            # add a learnable token to the paligemma model for observation register
-            self.obs_registers = nn.Parameter(
-                torch.zeros(config.num_obs_registers, self.paligemma.config.hidden_size)
-            )
+            # add a learnable token to the VLM for observation register
+            self.obs_registers = nn.Parameter(torch.zeros(config.num_obs_registers, vlm_hidden_size))
             self.obs_registers_pad_masks = torch.ones(
                 config.num_obs_registers, dtype=torch.bool
             )
@@ -131,21 +67,24 @@ class PiPolicy(nn.Module):
             assert not config.expert_only_use_register, (
                 "expert_only_use_register is set to True but num_obs_registers is 0."
             )
+        action_expert_config = config.action_expert_cfg
+        if action_expert_config.head_dim != text_head_dim:
+            print(
+                f"Warning: Overriding DiT head_dim {action_expert_config.head_dim} "
+                f"to match VLM text head_dim {text_head_dim}."
+            )
+            action_expert_config.head_dim = text_head_dim
+        if action_expert_config.num_key_value_heads != text_num_kv_heads:
+            print(
+                f"Warning: Overriding DiT num_key_value_heads {action_expert_config.num_key_value_heads} "
+                f"to match VLM text num_key_value_heads {text_num_kv_heads}."
+            )
+            action_expert_config.num_key_value_heads = text_num_kv_heads
 
-        # number of hidden layers and head dim must match to do cross-attention at each layer
-        vlm_hf_config = self.paligemma.config
-        action_expert_config = get_config(config.action_expert_variant)
-        assert (
-            vlm_hf_config.text_config.num_hidden_layers
-            == action_expert_config.num_hidden_layers
-        ), f"VLM and action expert must have the same number of layers, got {vlm_hf_config.text_config.num_hidden_layers} and {action_expert_config.num_hidden_layers}"
-        assert (
-            vlm_hf_config.text_config.head_dim == action_expert_config.head_dim
-        ), f"VLM and action expert must have the same head dim, got {vlm_hf_config.text_config.head_dim} and {action_expert_config.head_dim}"
-
-        start_time = end_time
-        self.gemma_expert = DiTModel(config=action_expert_config)
+        start_time = time.time()
+        self.action_expert = DiTModel(config=action_expert_config)
         end_time = time.time()
+        self.action_expert_layers = action_expert_config.num_hidden_layers
         print(f"Gemma expert model initialized in {end_time - start_time:.2f} seconds.")
 
         action_width = action_expert_config.hidden_size
@@ -175,85 +114,32 @@ class PiPolicy(nn.Module):
         self.suffix_pad_mask: at.Bool[torch.Tensor, "action_horizon"]
         self.suffix_att_mask: at.Bool[torch.Tensor, "action_horizon"]
 
-    def embed_prefix(
-        self,
-        images: at.Float[torch.Tensor, "b n_cam c h w"],
-        img_masks: at.Bool[torch.Tensor, "b n_cam 1"],
-        lang_tokens: at.Int64[torch.Tensor, "b l"],
-        lang_masks: at.Bool[torch.Tensor, "b l"],
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        """Embed images with SigLIP and language tokens with embedding layer to prepare
-        for PaliGemma transformer processing.
-        """
-        embs = []
-        pad_masks = []
-        att_masks = []
-
-        torch.cuda.nvtx.range_push("image_embedding")
-        images_flat = einops.rearrange(images, "b n_cam c h w -> (b n_cam) c h w")
-        img_emb_flat: at.Float[torch.Tensor, "(b n_cam) n_emb img_emb_dim"] = (
-            self._apply_checkpoint(
-                self.paligemma.model.get_image_features,
-                images_flat,
-            )
-        )
-        img_emb = einops.rearrange(
-            img_emb_flat,
-            " (b n_cam) n_emb img_emb_dim -> b (n_cam n_emb) img_emb_dim",
-            b=images.shape[0],
-            n_cam=images.shape[1],
-        )
-        img_mask_repeat = einops.repeat(
-            img_masks, "b n_cam 1 -> b (n_cam n_emb)", n_emb=img_emb_flat.shape[1]
-        )
-        torch.cuda.nvtx.range_pop()
-
-        embs.append(img_emb)
-        pad_masks.append(img_mask_repeat)
-        att_masks.append(
-            torch.zeros(img_emb.shape[1], dtype=torch.bool, device=img_emb.device)
-        )
-
-        torch.cuda.nvtx.range_push("language_embedding")
-        lang_emb = self._apply_checkpoint(
-            self.paligemma.language_model.embed_tokens, lang_tokens
-        )
-        torch.cuda.nvtx.range_pop()
-
-        embs.append(lang_emb)
-        pad_masks.append(lang_masks)
-        att_masks.append(
-            torch.zeros(lang_emb.shape[1], dtype=torch.bool, device=lang_emb.device)
-        )
-
+    def encode_prefix(
+        self, observation: Observation
+    ) -> Tuple[HiddenState, PrefixPadMask, List[KVCache]]:
+        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+        # Prepare extra observation register tokens if configured
+        extra_embs = None
+        extra_pad = None
+        extra_att = None
         if self.use_obs_register:
-            torch.cuda.nvtx.range_push("obs_register_embedding")
-            bsize = images.shape[0]
-            obs_tokens = einops.repeat(
-                self.obs_registers,
-                "s hidden_dim -> b s hidden_dim",
-                b=bsize,
+            bsize = observation.images.shape[0]
+            extra_embs = einops.repeat(
+                self.obs_registers, "s d -> b s d", b=bsize
             )
-            obs_token_pad_masks = einops.repeat(
-                self.obs_registers_pad_masks,
-                "s -> b s",
-                b=bsize,
-            )
-            embs.append(obs_tokens)
-            pad_masks.append(obs_token_pad_masks)
-            att_masks.append(self.obs_registers_att_masks)
-            torch.cuda.nvtx.range_pop()
+            extra_pad = einops.repeat(self.obs_registers_pad_masks, "s -> b s", b=bsize)
+            extra_att = self.obs_registers_att_masks
 
-        torch.cuda.nvtx.range_push("concat_embeddings")
-        embs = torch.cat(embs, dim=1)
-        pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.cat(att_masks, dim=0).expand(images.shape[0], -1)
-        torch.cuda.nvtx.range_pop()
-        return embs, pad_masks, att_masks
+        # Bridge handles model-specific preprocessing + transformer forward
+        hidden_states, prefix_pad_masks, kv_cache_list = self.vlm_bridge.encode_prefix(
+            images=observation.images,
+            image_masks=observation.image_masks,
+            tasks=(observation.task if isinstance(observation.task, list) else [observation.task] * observation.images.shape[0]),
+            extra_embs=extra_embs,
+            extra_pad_masks=extra_pad,
+            extra_att_masks=extra_att,
+        )
+        return hidden_states, prefix_pad_masks, kv_cache_list
 
     def embed_suffix(
         self,
@@ -295,56 +181,6 @@ class PiPolicy(nn.Module):
 
         return suffix_emb, pad_mask, att_mask, time_emb
 
-    def encode_prefix(
-        self, observation: Observation
-    ) -> Tuple[HiddenState, PrefixPadMask, List[KVCache]]:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
-        torch.cuda.nvtx.range_push("embed_prefix")
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            observation.images,
-            observation.image_masks,
-            observation.tokenized_prompt,
-            observation.tokenized_prompt_mask,
-        )
-        torch.cuda.nvtx.range_pop()
-
-        torch.cuda.nvtx.range_push("attention_mask")
-        prefix_att_2d_mask = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_att_mask = attention_fill_false_to_inf(prefix_att_2d_mask)[:, None, :, :]
-        # shape: [batch_size, 1, prefix_len, prefix_len]
-
-        hidden_size = prefix_embs.shape[-1]
-        hidden_states = prefix_embs * math.sqrt(hidden_size)
-        torch.cuda.nvtx.range_pop()
-
-        from transformers.models.gemma.modeling_gemma import (
-            GemmaModel,
-        )
-
-        model: GemmaModel = self.paligemma.language_model
-
-        torch.cuda.nvtx.range_push("rotary_embedding")
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        position_embeddings = model.rotary_emb.forward(prefix_embs, prefix_position_ids)
-        torch.cuda.nvtx.range_pop()
-
-        kv_cache_list: List[KVCache] = []
-        for i, layer in enumerate(model.layers):
-            # print(f"layer {i}: {hidden_states}")
-            torch.cuda.nvtx.range_push(f"layer_{i}")
-            hidden_states, (k, v) = self._apply_checkpoint(
-                getattr(layer, self.gemma_custom_forward_name),
-                hidden_states,
-                prefix_att_mask,
-                position_embeddings,
-            )
-            torch.cuda.nvtx.range_pop()
-
-            kv_cache_list.append((k, v))
-
-        hidden_states = model.norm(hidden_states)
-        return hidden_states, prefix_pad_masks, kv_cache_list
-
     def predict_suffix(
         self,
         state,
@@ -365,10 +201,11 @@ class PiPolicy(nn.Module):
         prefix_pad_mask = einops.repeat(prefix_pad_masks, "b p -> b s p", s=suffix_len)
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
         full_att_2d_mask = torch.cat([prefix_pad_mask, suffix_att_2d_masks], dim=2)
-        full_att_mask = attention_fill_false_to_inf(full_att_2d_mask)[:, None, :, :]
+        full_att_mask = attention_fill_false_to_inf(full_att_2d_mask)[:, None, :, :].to(dtype=suffix_embs.dtype)
         # shape: [batch_size, 1, suffix_len, prefix_len + suffix_len]
         torch.cuda.nvtx.range_pop()
 
+        prefix_key_values = prefix_key_values[-self.action_expert_layers:]
         # only use the last num_obs_registers tokens from the prefix for the expert
         if self.config.expert_only_use_register:
             torch.cuda.nvtx.range_push("select_obs_registers")
@@ -388,7 +225,12 @@ class PiPolicy(nn.Module):
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
         torch.cuda.nvtx.range_pop()
 
-        suffix_out, _ = self.gemma_expert.forward(
+        # import torch.distributed as dist
+        # if dist.get_rank() == 0:
+        #     breakpoint()
+        # dist.barrier()
+
+        suffix_out, _, disp_loss = self.action_expert.forward(
             inputs_embeds=suffix_embs,
             position_ids=position_ids,
             adarms_cond=adarms_cond,
@@ -396,7 +238,7 @@ class PiPolicy(nn.Module):
             past_key_values=prefix_key_values,
         )
         suffix_out = suffix_out[:, -self.config.action_horizon :, :]
-        return self.action_out_proj(suffix_out)
+        return self.action_out_proj(suffix_out), disp_loss
 
     @torch.inference_mode()
     def sample_actions(
@@ -417,7 +259,7 @@ class PiPolicy(nn.Module):
 
         x_t = noise
         while time >= dt / 2:
-            v_t = self.predict_suffix(
+            v_t, _ = self.predict_suffix(
                 observation.state,
                 prefix_pad_masks,
                 prefix_key_values,
@@ -429,18 +271,9 @@ class PiPolicy(nn.Module):
             time -= dt
         return x_t
 
-    # def forward(self, part: Literal["prefix", "suffix", "sample"], *args, **kwargs):
-    #     if part == "prefix":
-    #         return self.encode_prefix(*args, **kwargs)
-    #     elif part == "suffix":
-    #         return self.predict_suffix(*args, **kwargs)
-    #     elif part == "sample":
-    #         return self.sample_actions(*args, **kwargs)
-    #     else:
-    #         raise ValueError(f"Unknown part: {part}")
 
     def _apply_checkpoint(self, func, *args, **kwargs):
-        """Helper method to apply gradient checkpointing if enabled."""
+        """Deprecated: use bridge._apply_checkpoint where appropriate."""
         if self.training:
             return torch.utils.checkpoint.checkpoint(
                 func, *args, use_reentrant=False, preserve_rng_state=False, **kwargs

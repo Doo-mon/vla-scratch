@@ -8,6 +8,7 @@ from tqdm import tqdm
 import wandb
 import datetime
 from setproctitle import setproctitle
+import einops
 
 import torch
 import torch.nn.functional as F
@@ -101,12 +102,15 @@ class TrainConfig:
 
     clip_grad_norm: float = 1.0
     num_noise_per_sample: int = 8
+    num_noise_before_topk: int = 8
     detach_kv_cache: bool = False
+    disp_loss_weight: float = 0.25
 
     # logging and evaluation
     exp_name: str = "pi-training"
     log_interval: int = 32
     eval_interval: int = 512
+    save_interval: int = 1  # in epochs
     eval_fraction: float = 0.003
     eval_num_sample_steps: int = 10
     # data
@@ -114,6 +118,7 @@ class TrainConfig:
     # model
     policy: PolicyConfig = MISSING
     checkpoint_path: Optional[str] = None
+    load_optimizer: bool = True
     # wandb
     wandb: WandbCfg = field(default_factory=WandbCfg)
 
@@ -140,6 +145,11 @@ def main(cfg: DictConfig) -> None:
     OmegaConf.set_struct(cfg, False)
 
     train_cfg = cast(TrainConfig, OmegaConf.to_object(cfg))
+
+    if train_cfg.num_noise_before_topk < train_cfg.num_noise_per_sample:
+        raise ValueError(
+            "num_noise_before_topk must be >= num_noise_per_sample for top-k selection"
+        )
 
     # Resolve checkpoint path (supports file or directory)
     if train_cfg.checkpoint_path is not None:
@@ -206,10 +216,10 @@ def main(cfg: DictConfig) -> None:
             reduce_dtype=torch.float32,
             cast_forward_inputs=True,
         )
-        for layer in model.paligemma.language_model.layers:
+        for layer in model.vlm_bridge.model.language_model.layers:
             fully_shard(layer, mesh=mesh, mp_policy=mp_policy)
-            register_fsdp_forward_method(layer, model.gemma_custom_forward_name)
-        for block in model.gemma_expert.blocks:
+            register_fsdp_forward_method(layer, model.vlm_bridge.layer_custom_forward_name)
+        for block in model.action_expert.blocks:
             fully_shard(block, mesh=mesh, mp_policy=mp_policy)
 
         mp_policy_root = MixedPrecisionPolicy(
@@ -243,8 +253,8 @@ def main(cfg: DictConfig) -> None:
                 ]
                 layer.set_modules_to_backward_prefetch(layers_to_prefetch)
 
-        set_forward_backward_prefetch(model.paligemma.language_model.layers, 2, 2)
-        set_forward_backward_prefetch(model.gemma_expert.blocks, 2, 2)
+        set_forward_backward_prefetch(model.vlm_bridge.model.language_model.layers, 2, 2)
+        set_forward_backward_prefetch(model.action_expert.blocks, 2, 2)
 
         model: FSDPModule | PiPolicy
 
@@ -268,10 +278,13 @@ def main(cfg: DictConfig) -> None:
             model=model,
             checkpoint=train_cfg.checkpoint_path,
             global_rank=global_rank,
-            optimizer=optimizer,
+            optimizer=optimizer if train_cfg.load_optimizer else None,
         )
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    for group in optimizer.param_groups:
+        group["lr"] = lr
 
     if global_rank == 0:
         run = wandb.init(
@@ -349,6 +362,53 @@ def main(cfg: DictConfig) -> None:
                 )
                 torch.cuda.nvtx.range_pop()
 
+                torch.cuda.nvtx.range_push("Noise Sampling")
+                actions = data_sample.action_chunk.actions
+                action_horizon, action_dim = actions.shape[1], actions.shape[2]
+                noise_candidates = sample_noise(
+                    (
+                        actions.shape[0],
+                        train_cfg.num_noise_before_topk,
+                        *actions.shape[1:],
+                    ),
+                    device,
+                    dtype=actions.dtype,
+                )
+                action_flat = einops.rearrange(
+                    actions, "b h d -> b 1 (h d)", h=action_horizon, d=action_dim
+                )
+                noise_flat = einops.rearrange(
+                    noise_candidates,
+                    "b k h d -> b k (h d)",
+                    h=action_horizon,
+                    d=action_dim,
+                )
+                if train_cfg.num_noise_before_topk == train_cfg.num_noise_per_sample:
+                    selected_noise_flat = noise_flat
+                else:
+                    distances = torch.sum((noise_flat - action_flat) ** 2, dim=-1)
+                    topk_indices = torch.topk(
+                        distances,
+                        k=train_cfg.num_noise_per_sample,
+                        dim=1,
+                        largest=False,
+                    ).indices
+                    selected_noise_flat = torch.gather(
+                        noise_flat,
+                        dim=1,
+                        index=topk_indices.unsqueeze(-1).expand(
+                            -1, -1, noise_flat.shape[-1]
+                        ),
+                    )
+                # Match expand_tensor ordering (noise index first, then batch)
+                selected_noise = einops.rearrange(
+                    selected_noise_flat,
+                    "b k (h d) -> (k b) h d",
+                    h=action_horizon,
+                    d=action_dim,
+                )
+                torch.cuda.nvtx.range_pop()
+
                 torch.cuda.nvtx.range_push("Expand Data Sample")
                 data_sample = expand_tensor(data_sample, train_cfg.num_noise_per_sample)
                 prefix_pad_masks = expand_tensor(
@@ -370,16 +430,16 @@ def main(cfg: DictConfig) -> None:
                     ]
                     torch.cuda.nvtx.range_pop()
 
-                torch.cuda.nvtx.range_push("Noise Sampling")
+                torch.cuda.nvtx.range_push("Apply Noise")
                 actions = data_sample.action_chunk.actions
-                noise = sample_noise(actions.shape, device, dtype=actions.dtype)
+                noise = selected_noise
                 u_t = noise - actions
                 timestep = sample_time(time_dist, data_sample.shape)
                 noisy_actions = actions + timestep[:, None, None] * u_t
                 torch.cuda.nvtx.range_pop()
 
                 torch.cuda.nvtx.range_push("Model Predict Suffix")
-                v_t = model.predict_suffix(
+                v_t, disp_loss = model.predict_suffix(
                     state=data_sample.observation.state,
                     prefix_pad_masks=prefix_pad_masks,
                     prefix_key_values=prefix_key_values,
@@ -387,7 +447,8 @@ def main(cfg: DictConfig) -> None:
                     time=timestep,
                 )
                 losses = F.mse_loss(u_t, v_t, reduction="none")
-                loss = losses.mean()
+                flow_mse = losses.mean()
+                loss = flow_mse + train_cfg.disp_loss_weight * disp_loss
                 torch.cuda.nvtx.range_pop()
 
                 torch.cuda.nvtx.range_push("Loss Backward")
@@ -410,7 +471,8 @@ def main(cfg: DictConfig) -> None:
             torch.cuda.nvtx.range_pop()
 
             log_td = {}
-            log_td["loss/flow_mse"] = loss.detach()
+            log_td["loss/flow_mse"] = flow_mse.detach()
+            log_td["loss/disp_loss"] = disp_loss.detach()
             if isinstance(norm_before_clip, torch.distributed.tensor.DTensor):
                 norm_before_clip = norm_before_clip.full_tensor()
             log_td["loss/grad_norm"] = norm_before_clip
@@ -495,7 +557,10 @@ def main(cfg: DictConfig) -> None:
                 if global_rank == 0:
                     run.log(log_dict)
 
-        save_checkpoint(model, optimizer, global_rank, f"checkpoint_{epoch+1}.pth")
+        if (
+            (epoch + 1) % train_cfg.save_interval == 0
+        ):
+            save_checkpoint(model, optimizer, global_rank, f"checkpoint_{epoch+1}")
 
     if world_size > 1:
         dist.destroy_process_group()

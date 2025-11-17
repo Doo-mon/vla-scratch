@@ -100,49 +100,6 @@ class LiberoIPECGlobalConfig(DataConfig):
 
 
 @dataclass
-class LiberoIPECSpatialConfig(DataConfig):
-    @staticmethod
-    def _default_input_transform_configs() -> list[Dict[str, Any]]:
-        return [
-            {"_target_": "vla_scratch.datasets.libero.transforms.LiberoState"},
-            {"_target_": "vla_scratch.datasets.libero.transforms.LiberoImages"},
-        ]
-
-    @staticmethod
-    def _default_output_transform_configs() -> list[Dict[str, Any]]:
-        return [
-            {"_target_": "vla_scratch.datasets.libero.transforms.LiberoAction"},
-        ]
-
-    @staticmethod
-    def _default_output_inv_transform_configs() -> list[Dict[str, Any]]:
-        return [
-            {"_target_": "vla_scratch.datasets.libero.transforms.LiberoActionToGlobal"},
-        ]
-
-    _target_: str = "vla_scratch.datasets.libero.lerobot_ipec.IPECDataset"
-    repo_id: List[str] = field(
-        default_factory=lambda: [
-            "IPEC-COMMUNITY/libero_spatial_no_noops_1.0.0_lerobot",
-            # "IPEC-COMMUNITY/libero_90_no_noops_1.0.0_lerobot",
-        ]
-    )
-    input_transforms: List[Any] = field(
-        default_factory=_default_input_transform_configs
-    )
-    output_transforms: List[Any] = field(
-        default_factory=_default_output_transform_configs
-    )
-    output_inv_transforms: List[Any] = field(
-        default_factory=_default_output_inv_transform_configs
-    )
-
-    norm_stats_path: str = (
-        "normalization_stats/libero/IPEC-COMMUNITY/libero_spatial_no_noops_1.0.0_lerobot.npz"
-    )
-
-
-@dataclass
 class LiberoIPECDummyConfig(DataConfig):
     @staticmethod
     def _default_input_transform_configs() -> list[Dict[str, Any]]:
@@ -179,7 +136,13 @@ class LiberoIPECDummyConfig(DataConfig):
 
 
 cs = ConfigStore.instance()
-cs.store(name="libero-ipec", node=LiberoIPECConfig, group="data")
-cs.store(name="libero-ipec-global", node=LiberoIPECGlobalConfig, group="data")
-cs.store(name="libero-ipec-spatial", node=LiberoIPECSpatialConfig, group="data")
-cs.store(name="libero-ipec-dummy", node=LiberoIPECDummyConfig, group="data")
+cs.store(name="libero-ipec", node=LiberoIPECConfig(), group="data")
+cs.store(name="libero-ipec-global", node=LiberoIPECGlobalConfig(), group="data")
+cs.store(
+    name="libero-ipec-spatial",
+    node=LiberoIPECGlobalConfig(
+        repo_id=["IPEC-COMMUNITY/libero_spatial_no_noops_1.0.0_lerobot"]
+    ),
+    group="data",
+)
+cs.store(name="libero-ipec-dummy", node=LiberoIPECDummyConfig(), group="data")

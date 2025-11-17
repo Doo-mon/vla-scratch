@@ -2,22 +2,15 @@ from dataclasses import dataclass, field
 from typing import Optional, Any, List
 from hydra.core.config_store import ConfigStore
 from vla_scratch.policies.config import PolicyConfig
+from vla_scratch.policies.modules.dit import DiTConfig
+
 
 def _default_pi_transforms() -> list[Any]:
     return [
         {
-            "_target_": "vla_scratch.policies.pi.transforms.StructurePrompt",
-        },
-        {
-            "_target_": "vla_scratch.policies.pi.transforms.TokenizePrompt",
-            "processor_class": "PaliGemmaProcessor",
-            "model_id": "google/paligemma-3b-mix-224",
-            "max_length": 64,
-        },
-        {
             "_target_": "vla_scratch.policies.pi.transforms.PreprocessImage",
             "target_size": (224, 224),
-        },
+        }
     ]
 
 
@@ -27,8 +20,20 @@ class PiConfig(PolicyConfig):
 
     transforms: List[Any] = field(default_factory=_default_pi_transforms)
 
-    action_expert_variant: str = "300m"
+    action_expert_cfg: DiTConfig = DiTConfig(
+        hidden_size=1024,
+        num_hidden_layers=12,
+        intermediate_size=4096,
+        num_attention_heads=8,
+        num_key_value_heads=1,
+        head_dim=256,
+    )
     model_id: str = "google/paligemma-3b-mix-224"
+    # Name of the VLM class from `transformers` to instantiate.
+    # Examples: "PaliGemmaForConditionalGeneration", "Qwen3VLForConditionalGeneration"
+    vlm_type: str = "PaliGemmaForConditionalGeneration"
+    # Max text tokens for VLM tokenization (wrapper-specific)
+    max_prompt_length: int = 64
 
     state_dim: Optional[int] = None
     action_dim: Optional[int] = None
@@ -42,4 +47,20 @@ class PiConfig(PolicyConfig):
 
 
 Cs = ConfigStore.instance()
-Cs.store(name="pi", node=PiConfig, group="policy")
+Cs.store(name="pi", node=PiConfig(), group="policy")
+Cs.store(
+    name="pi-qwen",
+    node=PiConfig(
+        model_id="Qwen/Qwen3-VL-2B-Instruct",
+        vlm_type="Qwen3VLForConditionalGeneration",
+        max_prompt_length=256,
+        action_expert_cfg= DiTConfig(
+            hidden_size=1024,
+            num_hidden_layers=12,
+            intermediate_size=4096,
+            num_attention_heads=8,
+            num_key_value_heads=8,
+            head_dim=256,)
+    ),
+    group="policy",
+)

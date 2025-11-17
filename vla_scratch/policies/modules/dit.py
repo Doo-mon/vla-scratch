@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import List, Tuple, Callable
 import einops
@@ -11,28 +12,8 @@ from torch.nn import RMSNorm
 from transformers.activations import ACT2FN
 
 from vla_scratch.policies.data_types import *
+from vla_scratch.policies.utils import apply_rotary_pos_emb
 
-
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-# @torch.compile
-def apply_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    *,
-    unsqueeze_dim: int = 1,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
 
 
 @torch.compile
@@ -107,12 +88,16 @@ class RotaryEmbedding(nn.Module):
 class DiTConfig:
     hidden_size: int
     intermediate_size: int
-    num_hidden_layers: int
     num_attention_heads: int
     num_key_value_heads: int
     head_dim: int
 
     mlp_activation: str = "silu"
+
+    num_hidden_layers: int = 12
+    layers_for_dispersive_loss = [6]
+    # layers_for_dispersive_loss = [4, 6, 8]
+    dispersive_loss_tau: float = 1.0
 
     rms_norm_eps: float = 1e-6
     attention_dropout: float = 0.0
@@ -120,41 +105,6 @@ class DiTConfig:
     max_position_embeddings: int = 8192
     rope_theta: float = 10000.0
 
-
-from typing import Literal
-Variant = Literal["dummy", "300m", "2b"]
-
-def get_config(variant: Variant) -> DiTConfig:
-    """Returns config for specified gemma variant."""
-    if variant == "dummy":
-        return DiTConfig(
-            hidden_size=64,
-            num_hidden_layers=4,
-            intermediate_size=128,
-            num_attention_heads=8,
-            num_key_value_heads=1,
-            head_dim=16,
-        )
-    if variant == "300m":
-        # 311M params
-        return DiTConfig(
-            hidden_size=1024,
-            num_hidden_layers=18,
-            intermediate_size=4096,
-            num_attention_heads=8,
-            num_key_value_heads=1,
-            head_dim=256,
-        )
-    if variant == "2b":
-        return DiTConfig(
-            hidden_size=2048,
-            num_hidden_layers=18,
-            intermediate_size=16384,
-            num_attention_heads=8,
-            num_key_value_heads=1,
-            head_dim=256,
-        )
-    raise ValueError(f"Unknown variant: {variant}")
 
 class Attention(nn.Module):
     def __init__(self, config: DiTConfig, layer_idx: int):
@@ -228,6 +178,11 @@ class Attention(nn.Module):
             past_k, past_v = kv_cache
             k_rotate = torch.cat([past_k, k_rotate], dim=-2)
             v = torch.cat([past_v, v], dim=-2)
+
+        # import torch.distributed as dist
+        # if dist.get_rank() == 0:
+        #     breakpoint()
+        # dist.barrier()
 
         attn_output = F.scaled_dot_product_attention(
             q_rotate,
@@ -347,7 +302,9 @@ class DiTModel(nn.Module):
         attention_mask: AttentionMask | None = None,
         past_key_values: List[KVCache] | None = None,
         # num_kv = num_q + len(past_key_values)
-    ) -> Tuple[HiddenState, List[KVCache]]:
+    ) -> Tuple[HiddenState, List[KVCache]] | Tuple[
+        HiddenState, List[KVCache], torch.Tensor | None
+    ]:
         # We currently ignore past_key_values as caching is not implemented.
         if inputs_embeds is None:
             raise ValueError("inputs_embeds must be provided.")
@@ -360,12 +317,15 @@ class DiTModel(nn.Module):
 
         hidden_states = inputs_embeds
         kv_cache_list: List[KVCache] = []
+        hidden_states_for_dispersive_loss = []
         for i, layer in enumerate(self.blocks):
             if past_key_values is not None:
                 kv_cache = past_key_values[i]
             else:
                 kv_cache = None
             torch.cuda.nvtx.range_push(f"layer_{i}")
+            if i in self.config.layers_for_dispersive_loss:
+                hidden_states_for_dispersive_loss.append(hidden_states)
             if self.training:
                 hidden_states, k, v = torch.utils.checkpoint.checkpoint(
                     layer,
@@ -390,4 +350,24 @@ class DiTModel(nn.Module):
             kv_cache_list.append((k, v))
 
         hidden_states = self.norm(hidden_states)
-        return hidden_states, kv_cache_list
+
+        dispersive_loss = 0
+        if hidden_states_for_dispersive_loss:
+            dispersive_loss = self._compute_dispersive_loss(
+                hidden_states_for_dispersive_loss
+            )
+
+        return hidden_states, kv_cache_list, dispersive_loss
+
+    def _compute_dispersive_loss(
+        self, hidden_states_list: List[torch.Tensor]
+    ) -> torch.Tensor:
+        """InfoNCE-based dispersive loss using squared L2 distance."""
+        tau = self.config.dispersive_loss_tau
+        hidden_states = torch.stack(hidden_states_list, dim=1)
+        z = einops.rearrange(hidden_states, "b l s d -> (b l) (s d)")
+        z_cast = z.type(torch.float32)
+        diff = nn.functional.pdist(z_cast).pow(2) / z.shape[1]
+        diff = diff.type(z.dtype)
+        diff = torch.concat((diff, diff, torch.zeros(z.shape[0]).cuda()))
+        return torch.log(torch.exp(-diff / tau).mean())

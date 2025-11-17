@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import importlib
-from typing import Dict
+from typing import Dict, List
 
 
 from vla_scratch.transforms.base import TransformFn
@@ -69,6 +69,65 @@ class TokenizePrompt(TransformFn):
             truncation=True,
             padding="max_length",
         )
+        sample[TOKENIZED_KEY] = encoded["input_ids"].squeeze(0).long()
+        sample[TOKENIZED_MASK_KEY] = encoded["attention_mask"].squeeze(0).bool()
+        return sample
+
+
+class QwenChatTemplateTokenize(TransformFn):
+    """Tokenize prompt using Qwen3-VL chat template.
+
+    This uses `AutoProcessor.apply_chat_template` to build a chat-formatted prompt that
+    includes image placeholders, then tokenizes to fixed length for batching.
+
+    Note: This prepares only text token IDs and masks. Qwen3-VL models also expect
+    processed vision inputs at inference/training time, which are not produced here.
+    """
+
+    def __init__(
+        self,
+        model_id: str,
+        max_length: int = 256,
+        add_generation_prompt: bool = True,
+        padding: str | bool = "max_length",
+    ) -> None:
+        from transformers import AutoProcessor
+
+        self.processor = AutoProcessor.from_pretrained(model_id)
+        # Qwen chat models commonly use left-padding for generation
+        if hasattr(self.processor, "tokenizer"):
+            self.processor.tokenizer.padding_side = "left"
+        self.max_length = max_length
+        self.add_generation_prompt = add_generation_prompt
+        self.padding = padding
+
+    def compute(self, sample: Dict) -> Dict:
+        # Expect prior StructurePrompt to set `sample["prompt"]`
+        prompt: str = sample.get("prompt", sample.get(TASK_KEY, ""))
+        images: torch.Tensor = sample[PROCESSED_IMAGE_KEY]
+
+        # Build messages with image content then the user prompt
+        # images: [n_cam, 3, H, W] (torch.Tensor)
+        content: List[Dict] = [
+            {"type": "image", "image": img} for img in images
+        ]
+        content.append({"type": "text", "text": prompt})
+        messages = [{"role": "user", "content": content}]
+
+        # Produce chat-formatted string, then tokenize to fixed length
+        chat_str = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=self.add_generation_prompt,
+        )
+        encoded = self.processor.tokenizer(
+            chat_str,
+            max_length=self.max_length,
+            truncation=True,
+            padding=self.padding,
+            return_tensors="pt",
+        )
+
         sample[TOKENIZED_KEY] = encoded["input_ids"].squeeze(0).long()
         sample[TOKENIZED_MASK_KEY] = encoded["attention_mask"].squeeze(0).bool()
         return sample
