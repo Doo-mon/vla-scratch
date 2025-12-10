@@ -16,7 +16,7 @@ Examples:
 """
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 from tqdm import tqdm
 
 
@@ -122,8 +122,9 @@ def main(cfg: DictConfig) -> None:
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
 
-    data_cfg: DataConfig = cfg.data
-    policy_cfg: PolicyConfig = cfg.policy
+    run_cfg = cast(NormStatsConfig, OmegaConf.to_object(cfg))
+    data_cfg: DataConfig = run_cfg.data
+    policy_cfg: PolicyConfig = run_cfg.policy
 
     # Keep temporal params aligned if one is overridden
     if data_cfg.action_horizon is None:

@@ -12,6 +12,7 @@ from tqdm import tqdm
 from torch.distributed.tensor import DTensor
 
 from vla_scratch.helpers.data import create_dataset
+from vla_scratch.utils.dataloader import DistributedRankAwareBatchSampler
 
 if TYPE_CHECKING:
     from tensordict import TensorDict
@@ -79,22 +80,34 @@ def _create_dataloader(
     world_size: int,
     global_rank: int,
 ) -> DataLoader:
+    base_sampler = getattr(dataset, "sampler", None)
+    distributed_batch_sampler = None
+
     if world_size > 1:
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=world_size,
-            rank=global_rank,
-            shuffle=shuffle,
-            drop_last=shuffle,
-        )
+        if base_sampler is not None:
+            distributed_batch_sampler = DistributedRankAwareBatchSampler(
+                base_sampler,
+                batch_size=batch_size,
+                drop_last=shuffle,
+                num_replicas=world_size,
+                rank=global_rank,
+            )
+            sampler = None
+        else:
+            sampler = DistributedSampler(
+                dataset,
+                num_replicas=world_size,
+                rank=global_rank,
+                shuffle=shuffle,
+                drop_last=shuffle,
+            )
     else:
-        sampler = None
+        sampler = base_sampler
 
     def collate_fn(batch):
         return tuple(torch.stack(items) for items in zip(*batch))
 
     loader_kwargs = dict(
-        batch_size=batch_size,
         num_workers=train_cfg.num_workers,
         persistent_workers=train_cfg.num_workers > 0,
         pin_memory=torch.cuda.is_available(),
@@ -102,9 +115,13 @@ def _create_dataloader(
     )
     if train_cfg.num_workers > 0:
         loader_kwargs["prefetch_factor"] = train_cfg.prefetch_factor
-    if sampler is not None:
+    if distributed_batch_sampler is not None:
+        loader_kwargs["batch_sampler"] = distributed_batch_sampler
+    elif sampler is not None:
+        loader_kwargs["batch_size"] = batch_size
         loader_kwargs["sampler"] = sampler
     else:
+        loader_kwargs["batch_size"] = batch_size
         loader_kwargs["shuffle"] = shuffle
 
     return DataLoader(dataset, **loader_kwargs)
