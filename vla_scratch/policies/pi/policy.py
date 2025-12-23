@@ -80,6 +80,9 @@ class PiPolicy(BasePolicy):
             self.vlm_bridge = Qwen3VLBridge(
                 model_id=config.model_id,
                 vlm_type=config.vlm_type,
+                use_grid_thw_list=config.qwen3_vl_use_grid_thw_list,
+                recompute_pos_ids=config.qwen3_vl_recompute_pos_ids,
+                masked_add_stack=config.qwen3_vl_masked_add_stack,
             )
         else:
             raise NotImplementedError(

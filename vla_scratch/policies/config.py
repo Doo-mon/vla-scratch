@@ -8,8 +8,8 @@ class PolicyConfig:
     _target_: str
     transforms: List[Any]
 
-    state_history: int = MISSING
-    action_horizon: int = MISSING
+    state_history: int
+    action_horizon: int
     state_dim: Optional[int] = None
     action_dim: Optional[int] = None
 

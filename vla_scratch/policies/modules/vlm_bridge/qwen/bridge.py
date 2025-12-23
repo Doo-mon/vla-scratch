@@ -21,13 +21,12 @@ from vla_scratch.policies.utils.transformers import make_att_2d_masks
 from vla_scratch.policies.modules.vlm_bridge.data_types import VLMOutputs
 
 if TYPE_CHECKING:
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel, Qwen3VLModel
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel, Qwen3VLVisionModel, Qwen3VLForConditionalGeneration
     from vla_scratch.transforms.data_types import Observation
-    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
 
 
 class Qwen3VLBridge(VLMBridge):
-    def __init__(self, *, model_id: str, vlm_type: str):
+    def __init__(self, *, model_id: str, vlm_type: str, use_grid_thw_list: bool = True, recompute_pos_ids: bool = False, masked_add_stack: bool = True):
         super().__init__()
         tfm = importlib.import_module("transformers")
         try:
@@ -35,7 +34,7 @@ class Qwen3VLBridge(VLMBridge):
         except AttributeError as e:
             raise ImportError(f"transformers has no class named '{vlm_type}'.") from e
 
-        self.causal_model: "Qwen3VLModel" = vlm_cls.from_pretrained(
+        self.causal_model: "Qwen3VLForConditionalGeneration" = vlm_cls.from_pretrained(
             model_id,
             attn_implementation="sdpa",
             trust_remote_code=True,
@@ -51,6 +50,10 @@ class Qwen3VLBridge(VLMBridge):
         replace_qwen3vl_forward()
         visual: "Qwen3VLVisionModel" = self.causal_model.model.visual
         visual.prepared_freq_table = visual.rotary_pos_emb(128)
+
+        self.use_grid_thw_list = use_grid_thw_list
+        self.recompute_pos_ids = recompute_pos_ids
+        self.masked_add_stack = masked_add_stack
 
     def apply_fsdp(self, mp_policy, mesh):
         fully_shard_layers(self.causal_model.model.visual.blocks, mesh, mp_policy)
@@ -90,7 +93,7 @@ class Qwen3VLBridge(VLMBridge):
         pixel_values = einops.rearrange(
             policy_td.pixel_values, "b grid patch -> (b grid) patch"
         )
-        if REPLACED:
+        if REPLACED and self.use_grid_thw_list:
             grid_thw_list = policy_td.image_grid_thw_list
             grid_thw_list = sum(grid_thw_list, [])
             assert all(
@@ -101,9 +104,9 @@ class Qwen3VLBridge(VLMBridge):
                 pixel_values, grid_thw_list
             )
         else:
-            image_grid_thw = policy_td.image_grid_thw.reshape(-1, 3)
+            grid_thw_tensor = policy_td.image_grid_thw.reshape(-1, 3)
             image_embeds, deepstack_image_embeds = self.causal_model.model.visual(
-                pixel_values, image_grid_thw
+                pixel_values, grid_thw_tensor
             )
         torch.cuda.nvtx.range_pop()
 
@@ -119,6 +122,13 @@ class Qwen3VLBridge(VLMBridge):
         position_ids = einops.rearrange(
             policy_td.position_ids, "b plane 1 s -> plane b s"
         )
+        if self.recompute_pos_ids:
+            position_ids, _ = self.causal_model.model.get_rope_index(
+                input_ids=policy_td.input_ids,
+                image_grid_thw=policy_td.image_grid_thw.flatten(0, 1),
+                attention_mask=policy_td.attention_mask,
+            )
+
         embs = [inputs_embeds]
         pad_masks = [input_pad_mask]
         att_masks = [
@@ -168,13 +178,6 @@ class Qwen3VLBridge(VLMBridge):
 
             past_key_values = DynamicCache()
 
-        if deepstack_image_embeds is not None:
-            deepstack_image_embeds_deltas = []
-            for layer_emb in deepstack_image_embeds:
-                delta = torch.zeros_like(embs)
-                delta.masked_scatter_(image_mask.unsqueeze(-1), layer_emb)
-                deepstack_image_embeds_deltas.append(delta)
-
         for layer_idx, decoder_layer in enumerate(lm.layers):
             torch.cuda.nvtx.range_push(f"layer_{layer_idx}")
             past_key_values_this_layer = copy(past_key_values) if not REPLACED else None
@@ -201,18 +204,29 @@ class Qwen3VLBridge(VLMBridge):
                 len(deepstack_image_embeds)
             ):
                 torch.cuda.nvtx.range_push("deepstack_inject")
-                hidden_states.add_(deepstack_image_embeds_deltas[layer_idx])
+                if self.masked_add_stack:
+                    delta = torch.zeros_like(hidden_states)
+                    delta.masked_scatter_(image_mask.unsqueeze(-1), deepstack_image_embeds[layer_idx])
+                    hidden_states.add_(delta)
+                else:
+                    local_this = hidden_states[image_mask, :].clone() + deepstack_image_embeds[layer_idx]
+                    hidden_states[image_mask, :] = local_this
                 torch.cuda.nvtx.range_pop()
 
         # compute ce loss
         hidden_states = lm.norm(hidden_states)
-        predicted_probs = self.causal_model.lm_head(hidden_states[:, :-extra_len])
-        predicted_probs = einops.rearrange(predicted_probs[:, :-1], "b s v -> (b s) v")
+        pred_logits = self.causal_model.lm_head(hidden_states[:, :-extra_len])
+        pred_logits = einops.rearrange(pred_logits[:, :-1], "b s v -> (b s) v")
         target_ids = einops.rearrange(policy_td.target_ids[:, 1:], "b s -> (b s)")
-        ce_loss = torch.nn.functional.cross_entropy(
-            predicted_probs, target_ids, ignore_index=TARGET_IGNORE_ID, reduction="sum"
+        ce_loss_sum = torch.nn.functional.cross_entropy(
+            pred_logits, target_ids, ignore_index=TARGET_IGNORE_ID, reduction="sum"
         )
-        ce_loss = ce_loss / (target_ids != TARGET_IGNORE_ID).sum().clamp(min=1)
+        # compute corect tokens
+        num_correct_tokens = (pred_logits.argmax(dim=-1) == target_ids).sum()
+
+        total = (target_ids != TARGET_IGNORE_ID).sum().clamp(min=1)
+        ce_loss = ce_loss_sum / total
+        accuracy = num_correct_tokens.float() / total
 
         key_states = torch.stack([k for k, v in kv_cache_list], dim=1)
         value_states = torch.stack([v for k, v in kv_cache_list], dim=1)

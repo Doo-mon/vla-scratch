@@ -17,7 +17,7 @@ from vla_scratch.policies.utils.transformers import apply_rotary_pos_emb
 from vla_scratch.policies.utils.training import apply_checkpoint_when_training
 
 
-def _qwen3vl_fast_rot_pos_emb(
+def _qwen3vl_rot_pos_emb(
     self: "Qwen3VLVisionModel", grid_thw_list: List[Tuple[int, int, int]]
 ) -> torch.Tensor:
     """GPU-friendly rotary position builder without .item()/.tolist() syncs."""
@@ -141,7 +141,7 @@ def _qwen3_vision_attn_fast_forward(
     position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     **kwargs,
 ) -> torch.Tensor:
-    grid_thw_list = cu_seqlens
+    grid_thw = cu_seqlens
     torch.cuda.nvtx.range_push("vision_attention")
     torch.cuda.nvtx.range_push("qkv_projection")
     qkv = einops.rearrange(
@@ -160,17 +160,9 @@ def _qwen3_vision_attn_fast_forward(
     torch.cuda.nvtx.range_pop()
 
     torch.cuda.nvtx.range_push("attn")
-    batch_size = len(grid_thw_list)
-    # from flash_attn import flash_attn_func
-    # attn_out = flash_attn_func(
-    #     einops.rearrange(query_states, "(b l) h d -> b l h d", b=batch_size),
-    #     einops.rearrange(key_states, "(b l) h d -> b l h d", b=batch_size),
-    #     einops.rearrange(value_states, "(b l) h d -> b l h d", b=batch_size),
-    #     causal=False,
-    #     softmax_scale=self.scaling,
-    # )
-    # attn_out = einops.rearrange(attn_out, "b l h d -> (b l) (h d)").contiguous()
-
+    batch_size = (
+        grid_thw.shape[0] if isinstance(grid_thw, torch.Tensor) else len(grid_thw)
+    )
     query_states = einops.rearrange(query_states, "(b l) h d -> b h l d", b=batch_size)
     key_states = einops.rearrange(key_states, "(b l) h d -> b h l d", b=batch_size)
     value_states = einops.rearrange(value_states, "(b l) h d -> b h l d", b=batch_size)
@@ -194,7 +186,7 @@ def _qwen3_vision_attn_fast_forward(
 def _qwen3_vision_model_fast_forward(
     self: "Qwen3VLVisionModel",
     pixel_values: torch.Tensor,
-    grid_thw_list: List[Tuple[int, int, int]],
+    grid_thw: List[Tuple[int, int, int]] | torch.Tensor,
 ) -> torch.Tensor:
     """
     Args:
@@ -208,18 +200,28 @@ def _qwen3_vision_model_fast_forward(
     """
     torch.cuda.nvtx.range_push("vision_embed")
     hidden_states = self.patch_embed(pixel_values)
-    pos_embeds = _qwen3vl_fast_pos_embed_interpolate(self, grid_thw_list)
+    if isinstance(grid_thw, torch.Tensor):
+        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+    else:
+        pos_embeds = _qwen3vl_fast_pos_embed_interpolate(self, grid_thw)
     hidden_states = hidden_states + pos_embeds
     torch.cuda.nvtx.range_pop()
 
     torch.cuda.nvtx.range_push("rotary_pos_emb")
     seq_len, _ = hidden_states.size()
     hidden_states = hidden_states.reshape(seq_len, -1)
-    rotary_pos_emb = _qwen3vl_fast_rot_pos_emb(self, grid_thw_list)
+
+    if isinstance(grid_thw, torch.Tensor):
+        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+    else:
+        rotary_pos_emb = _qwen3vl_rot_pos_emb(self, grid_thw)
+
     rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1).type(torch.float32)
     emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
     position_embeddings = (emb.cos(), emb.sin())
-    position_embeddings = tuple(pe.type(hidden_states.dtype) for pe in position_embeddings)
+    position_embeddings = tuple(
+        pe.type(hidden_states.dtype) for pe in position_embeddings
+    )
     torch.cuda.nvtx.range_pop()
 
     deepstack_feature_lists = []
@@ -230,7 +232,7 @@ def _qwen3_vision_model_fast_forward(
             self,
             blk,
             hidden_states,
-            cu_seqlens=grid_thw_list,
+            cu_seqlens=grid_thw,
             position_embeddings=position_embeddings,
         )
         torch.cuda.nvtx.range_pop()

@@ -55,6 +55,14 @@ dont_blind_8_8_objects_config_test = DontBlindConfig(
     ]
 )
 
+from vla_scratch.utils.paths import REPO_ROOT
+ours = DontBlindConfig(
+    repo_id="ours",
+    root_path=REPO_ROOT,
+    splits=[".*"],
+    norm_stats_path="normalization_stats/ours/lerobot_norm_stats-horizon_{data.action_horizon}-history_{data.state_history}.npz"
+)
+
 cs = ConfigStore.instance()
 cs.store(name="dont_blind", node=default_dont_blind_config, group="data")
 cs.store(
@@ -63,3 +71,4 @@ cs.store(
 cs.store(
     name="dont_blind_8_8_test", node=dont_blind_8_8_objects_config_test, group="data"
 )
+cs.store(name="ours", node=ours, group="data")

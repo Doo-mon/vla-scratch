@@ -37,11 +37,18 @@ class PiConfig(PolicyConfig):
     time_dist_alpha: float = 1.0
     time_dist_beta: float = 1.5
 
+    # already the best setting, only reserved for perf ablation
+    qwen3_vl_use_grid_thw_list: bool = True
+    qwen3_vl_recompute_pos_ids: bool = False
+    qwen3_vl_masked_add_stack: bool = True
+
 
 pi_paligemma_config = PiConfig(
     _target_="vla_scratch.policies.pi.policy.PiPolicy",
     model_id="google/paligemma-3b-mix-224",
     vlm_type="PaliGemmaForConditionalGeneration",
+    state_history=1,
+    action_horizon=10,
     transforms=[
         {
             "_target_": "vla_scratch.policies.modules.vlm_bridge.paligemma.processor.PaligemmaProcessor",

@@ -1,1 +1,1 @@
-from . import data_mix
+from .data import *

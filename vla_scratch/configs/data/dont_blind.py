@@ -7,6 +7,7 @@ from vla_scratch.datasets.dont_blind.config import (
     default_dont_blind_config,
     dont_blind_8_8_objects_config_train,
     dont_blind_8_8_objects_config_test,
+    ours,
 )
 
 cs = ConfigStore.instance()
@@ -54,3 +55,29 @@ cs.store(
     node=dont_blind_8_8_train_mix_cfg,
     group="train_data",
 )
+
+# ours data
+ours_eval_cfg = EvalDataCfg(
+    datasets={
+        "action_ours": EvalDatasetCfg(
+            data=ours,
+            eval_fraction=0.05,
+            eval_type="sample_mse",
+        ),
+        "generation_ours": EvalDatasetCfg(
+            data=replace(ours, bbox_only=True),
+            eval_fraction=0.1,
+            eval_type="generation",
+        ),
+    }
+)
+ours_train_cfg = TrainDataCfg(
+    datasets={
+        "action_a": TrainDatasetCfg(
+            data=ours,
+            batch_size=32,
+        ),
+    }
+)
+cs.store(name="ours_eval", node=ours_eval_cfg, group="eval_data")
+cs.store(name="ours_train", node=ours_train_cfg, group="train_data")

@@ -47,6 +47,10 @@ source .venv/bin/activate
 
 # Apply lerobot dataset patch https://github.com/huggingface/lerobot/issues/959
 patch -N -d .venv/lib/python3.10/site-packages/lerobot/datasets -p0 < ./patches/lerobot_dataset.patch
+
+# For torch compile and lerobot decode video
+apt update
+apt install -y python3.10-dev ffmpeg 
 ```
 
 ### Training
