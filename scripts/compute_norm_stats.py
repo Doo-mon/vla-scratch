@@ -16,7 +16,7 @@ Examples:
 """
 
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any, cast, TYPE_CHECKING
 from tqdm import tqdm
 
 
@@ -33,12 +33,14 @@ from vla_scratch.helpers.data import create_dataset
 from vla_scratch.policies.config import PolicyConfig
 
 from vla_scratch.transforms.data_keys import PROCESSED_ACTION_KEY, PROCESSED_STATE_KEY
-from vla_scratch.transforms.data_types import DataSample
 from vla_scratch.transforms.normalization import (
     save_norm_stats,
     NormStats,
     FieldNormStats,
 )
+
+if TYPE_CHECKING:
+    from vla_scratch.transforms.data_types import DataSample
 
 @dataclass
 class NormStatsConfig:
@@ -94,7 +96,7 @@ def compute_and_save_norm_stats(
     batches = []
     for batch, _ in tqdm(dataloader, desc="Computing norm stats"):
         batches.append(batch)
-    stacked: DataSample = torch.cat(batches)
+    stacked: "DataSample" = torch.cat(batches)
     state_tensor = stacked.observation.state
     action_tensor = stacked.action_chunk.actions
 

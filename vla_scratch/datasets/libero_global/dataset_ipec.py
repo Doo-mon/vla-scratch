@@ -5,7 +5,7 @@ import torch
 import numpy as np
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata, LeRobotDataset
 
-from vla_scratch.datasets.libero.data_keys import (
+from .data_keys import (
     CAM_FRONT_KEY,
     CAM_WRIST_KEY,
     TASK_NAME_KEY,

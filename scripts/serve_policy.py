@@ -30,7 +30,7 @@ from vla_scratch.utils.checkpoint import (
     load_model_from_checkpoint,
 )
 from vla_scratch.utils.config import merge_cfg_from_checkpoint
-from vla_scratch.datasets.libero.data_keys import (
+from vla_scratch.datasets.libero_global.data_keys import (
     ARM_STATE_CART_POS_KEY,
     ARM_STATE_CART_ROT_KEY,
     CAM_FRONT_KEY,
@@ -213,13 +213,13 @@ def main(cfg: DictConfig) -> None:
     logger.info("Using device: %s", device)
 
     # Create model from policy config
-    print("Initializing model...")
     for i, spec in enumerate(list(serve_cfg.data.input_transforms or [])):
         if isinstance(spec, dict) and "enable_aug" in spec:
             spec.update({"enable_aug": False})
             serve_cfg.data.input_transforms[i] = spec
 
     _initialize_policy_dims(serve_cfg.data, serve_cfg.policy)
+    print("Initializing model...")
     with torch.device(device):
         model = create_policy(serve_cfg.policy)
     print("Model initialized.")
