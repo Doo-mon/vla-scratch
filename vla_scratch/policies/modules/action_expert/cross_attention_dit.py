@@ -117,6 +117,7 @@ class DiTConfig:
     cross_attention_every: int = 2
     qk_norm: Optional[str] = "layernorm"
     rotary_self_attn: bool = True
+    only_attend_to_final_layer: bool = False
 
     attn_dropout: float = 0.0
     mlp_dropout: float = 0.0
@@ -244,7 +245,6 @@ class Attention(nn.Module):
             attn_output, "b h seq_q d -> b seq_q (h d)"
         ).contiguous()
         return self.o_proj(attn_output), (k_rotate, v)
-
 
 class DecoderBlock(nn.Module):
     def __init__(self, config: DiTConfig, layer_idx: int):
@@ -386,7 +386,10 @@ class DiTModel(nn.Module):
         for i, layer in enumerate(self.blocks):
             is_cross = (i % cross_every) == (cross_every - 1)
             if is_cross:
-                encoder_hidden_this_layer = encoder_hidden_states[i // cross_every]
+                if self.config.only_attend_to_final_layer:
+                    encoder_hidden_this_layer = encoder_hidden_states[-1]
+                else:
+                    encoder_hidden_this_layer = encoder_hidden_states[i // cross_every]
                 attention_mask_this_layer = attention_mask
                 pos_emb_this_layer = None
             else:
