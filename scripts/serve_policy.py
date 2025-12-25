@@ -206,7 +206,6 @@ def main(cfg: DictConfig) -> None:
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
 
-    # Optionally override fields with saved configs from checkpoint dir
     serve_cfg = cast(ServeConfig, OmegaConf.to_object(cfg))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -282,7 +281,6 @@ def main(cfg: DictConfig) -> None:
         policy.reset()
 
     server = ZmqPolicyServer(host=serve_cfg.host, port=serve_cfg.port, metadata=metadata)
-    # server = WebsocketPolicyServer(policy=policy, host=serve_cfg.host, port=serve_cfg.port, metadata=metadata)
 
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
