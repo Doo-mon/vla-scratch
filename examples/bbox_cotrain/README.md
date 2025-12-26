@@ -20,11 +20,10 @@ python scripts/serve_policy.py \
   policy=pi-qwen \
   policy.state_history=0 \
   policy.action_horizon=10 \
-  use_state=False \
+  policy.transforms.0.max_length=500 \
   data=bbox_cotrain_train \
-  checkpoint_path=/path/to/checkpoint_dir_or_file \
-  host=0.0.0.0 port=8000 \
-  inference_steps=10
+  inference_steps=10 \
+  checkpoint_path=/path/to/checkpoint_dir_or_file
 ```
 
 Sim client (adapt BlindVLA batched eval to call the ZMQ server):
