@@ -1,10 +1,10 @@
 <div align="left">
-  <h2>
+  <h1>
   VLA-Scratch: 
   <!-- <br/> -->
-  a Modular, Performant, Transparent Stack<br/>
+  a Modular, Performant, Efficient Stack<br/>
   For Vision-Language-Action Models
-  </h2>
+  </h1>
 </div>
 <!-- add a huggingface badge, a twitter badge and a github star badge -->
 
@@ -22,6 +22,10 @@
     - Training, eval, and serving scripts share a common config grammar, so switching between workflows is seamless.
     - TODO: example script snippet here.
 
+
+## 🎯 Capabilities
+
+TODO: Heterogeneous dataset co-training (VQA, Action), Multi VLM backbone, Simulation-ready Serving scripts, feature rich visualizations, etc.
 
 ## 🗂️ Codebase Structure
 
@@ -45,9 +49,6 @@ VLA-Scratch is a fully modular, high-performance VLA stack built around Hydra co
 uv sync
 source .venv/bin/activate
 
-# Apply lerobot dataset patch https://github.com/huggingface/lerobot/issues/959
-patch -N -d .venv/lib/python3.10/site-packages/lerobot/datasets -p0 < ./patches/lerobot_dataset.patch
-
 # For torch compile and lerobot decode video
 apt update
 apt install -y python3.10-dev ffmpeg 
@@ -65,9 +66,9 @@ torchrun --standalone --nnodes=1 --nproc_per_node=4 \
     data=dont_blind \
     eval_data=dont_blind_8_8_eval \
     batch_size=32 \
-    lr.base=3e-6 \
-    +lr.vlm_bridge=3e-7 \
-    +lr.action_expert=3e-6 \
+    lr.base=5e-5 \
+    +lr.vlm_bridge=1e-5 \
+    +lr.action_expert=5e-5 \
     wandb.mode=online
 ```
 
