@@ -15,37 +15,82 @@
 
 ## Core Execution Flow
 
-1. Policies expose `encode_prefix` and `predict_suffix`; `compute_loss` and `sample_actions` simply compose those primitives during training/serving.
-2. `encode_prefix` calls the chosen VLM bridge, which runs the vision-language encoder and caches its activations as [`VLMOutputs`](../../vla_scratch/policies/modules/vlm_bridge/data_types.py).
-3. `predict_suffix` consumes `VLMOutputs`, denoises a Gaussian sample via the action expert head, and produces articulated actions.
-4. Layer-wise FSDP sharding and gradient checkpointing are attached through helpers in `utils/training.py`.
-5. Each VLM bridge expects `Observation.policy_input` to be prepared by its matching processor (e.g., `QwenBridge` with `QwenProcessor`), ensuring modality-specific tensors are present before the forward pass.
+1. Policies expose `encode_prefix` and `predict_suffix`; `compute_loss` and `sample_actions` compose those primitives during training and serving.
+2. `encode_prefix` calls the chosen VLM bridge to produce [`VLMOutputs`](../../vla_scratch/policies/modules/vlm_bridge/data_types.py).
+3. Each VLM bridge expects `Observation.policy_input` to be prepared by its matching processor (e.g., `QwenBridge` with `QwenProcessor`), ensuring modality-specific tensors are present before the forward pass.
+4. `predict_suffix` consumes `VLMOutputs`, denoises Gaussian noises to predict flow matching velocity field via the action expert head.
+5. Layer-wise FSDP sharding and gradient checkpointing are applied through helpers in `utils/training.py`.
 
 ## Optimizations
 
-Most performance gains come from spotting CUDA↔CPU syncs and eliminating them via three strategies:
 
-1. **Move “bookkeeping” into the processor.** If the computation is sequential / token-by-token, but doesn’t depend on any model activations, it belongs in the data pipeline. In Qwen, the mRoPE indices fall into this bucket: we compute `position_ids` and `mrope_position_deltas` during preprocessing (see `vla_scratch/policies/modules/vlm_bridge/qwen/processor.py:QwenProcessor.get_rope_index`) so batches arrive at the policy already fully annotated.
+<table>
+<tr>
+<td width="70%" valign="top">
+<h3>Reduction #1: Keep dynamic shape metadata on CPU</h3>
 
-2. **Keep dynamic shape metadata reside on CPU.** The syncs that remain are usually caused by allocating tensors whose size depends on values of CUDA tensors. With Qwen3-VL, operations like `fast_pos_embed_interpolate` depend on the values in `image_thw` CUDA tensor. The fix is to pass CPU-native shapes (`image_grid_thw_list`) as Python tuples inside the policy input (`modules/vlm_bridge/qwen/processor.py:QwenPolicyInput`), and then route the forward through the optimized path that consumes that list (`modules/vlm_bridge/qwen/utils.py:_qwen3vl_fast_pos_embed_interpolate`).
+During encoding the image features, position embeddings are interpolated to match the spatial dimensions of each image and added to the input image tokens. This requires creating tensors whose shapes depend on the input image size.
 
-3. **Make the forward pass “shape-stable”.** One more trick is avoiding variable-sized intermediates when injecting deepstack visual features. The classic pattern is:
-    ```python
-    local_this = hidden_states[visual_pos_masks, :].clone() + visual_embeds
-    hidden_states[visual_pos_masks, :] = local_this
-    ```
-            
-    it can be optimized to
-    ```python
-    delta = torch.zeros_like(hidden_states)
-    delta.masked_scatter_(visual_pos_masks.unsqueeze(-1), visual_embeds)
-    hidden_states.add_(delta)
-    ```
+In the original implementation, everything is converted to tensors after the dataloader output, then during the forward pass the shape metadata is read from CUDA tensors, causing frequent synchronizations. We instead store the shape metadata (height and width) as CPU integers in the dataloader output. That keeps it on CPU when calling `batch.to(device)` and avoids these syncs.
+<pre><code class="language-python"># Reading dynamic shape from CUDA tensors
+def pos_embed_interpolate(self, grid_thw):
+    grid_ts, grid_hs, grid_ws = grid_thw.unbind(1)
+    for t, h, w in zip(grid_ts, grid_hs, grid_ws):
+        h_idxs = torch.arange(0, h, self.step)
+        w_idxs = torch.arange(0, w, self.step)
+</code></pre>
+</td>
+<td width="30%" valign="center">
+<img src="../../assets/policies/performance-reduction-1.png" width="100%" alt="Reduction #1">
+<br>
+<em>Reduction #1: stop the img_thw from being moved to GPU to read desired tensor shapes without sync.</em>
+</td>
+</tr>
+</table>
 
-    Because `local_this` has a shape that depends on `visual_pos_masks.sum()`, and producing it can trigger a sync when the mask lives on the GPU. In our bridge, we follow the “scatter-then-add” approach for deepstack features (see `vla_scratch/policies/modules/vlm_bridge/qwen/bridge.py:Qwen3VLBridge.encode`).
+<table>
+<tr>
+<td width="70%" valign="top">
+<h3>Reduction #2: Move "heavy lifting" to dataloader</h3>
 
+The 3D-RoPE index computation in Qwen3-VL scans inputs token-by-token with conditional logic. When performed on CUDA tensors, this introduces synchronization at fine granularity.
 
-## When adding a new Policy
-1. Define its config under `policies/<name>/config.py` and register it with Hydra.
-2. Implement the policy model (subclass `BasePolicy`). Reuse modules/bridges/utilities where possible.
-3. Add any policy-specific processors under `modules/...` if they will be shared, or locally under the policy if truly bespoke.
+Since this computation doesn't depend on any model activations, we precompute these indices in the dataloader. Multiprocessing workers handle the preprocessing in parallel, shifting the heavy lifting off the forward pass and overlapping it with model computation.
+
+<pre><code class="language-python"># Conditional flows depend on CUDA tensors
+for token in input_ids:
+    if token == vision_start_token_id:
+        ...
+    if token == image_token_id:
+        ...
+</code></pre>
+</td>
+<td width="30%" valign="center">
+<img src="../../assets/policies/performance-reduction-2.png" width="100%" alt="Reduction #2">
+<br>
+<em>Reduction #2: move conditional logic to dataloader multiprocessing workers.</em>
+</td>
+</tr>
+</table>
+
+<table>
+<tr>
+<td colspan="2" valign="top">
+<h3>Reduction #3: Make the forward pass shape-stable</h3>
+
+The DeepStack operation that fuses image embeddings into the hidden states of LLM layers also introduces tensors whose shapes depend on values in CUDA tensors, which triggers synchronization.
+<pre><code class="language-python"># HuggingFace implementation (dynamic shaped tensor)
+local_delta = hidden_states[visual_pos_masks, :].clone() + visual_embeds
+hidden_states[visual_pos_masks, :] = local_delta
+</code></pre>
+
+We rewrite the same operation with a clever <code>masked_scatter</code> operator to preserve static tensor shapes.
+<pre><code class="language-python"># Optimized version (shape-stable)
+global_delta = torch.zeros_like(hidden_states)
+global_delta.masked_scatter_(visual_pos_masks.unsqueeze(-1), visual_embeds)
+hidden_states = hidden_states + global_delta
+</code></pre>
+</td>
+</tr>
+</table>
+

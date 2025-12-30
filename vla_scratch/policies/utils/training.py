@@ -43,9 +43,10 @@ def apply_checkpoint_when_training(
     func,
     *args,
     preserve_rng_state: bool = False,
+    disable: bool = False,
     **kwargs,
 ):
-    if module.training:
+    if module.training and not disable:
         return checkpoint.checkpoint(
             func,
             *args,

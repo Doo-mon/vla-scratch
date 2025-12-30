@@ -410,6 +410,7 @@ class DiTModel(nn.Module):
                 attention_mask=attention_mask_this_layer,
                 encoder_hidden_states=encoder_hidden_this_layer,
                 preserve_rng_state=self.use_dropout,
+                disable=True,
             )
             torch.cuda.nvtx.range_pop()
 
