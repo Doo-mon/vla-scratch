@@ -59,7 +59,7 @@ apt install -y python3.10-dev ffmpeg
 torchrun --standalone --nnodes=1 --nproc_per_node=8 \
     train_policy.py \
     policy=pi-qwen \
-    policy.state_history=0 \
+    policy.state_history=1 \
     policy.action_horizon=10 \
     policy.use_state=False \
     policy.transforms.0.max_length=500 \
@@ -72,12 +72,5 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
     wandb.mode=online
 ```
 
-<!-- 
-
-```bash
-hf download IPEC-COMMUNITY/libero_spatial_no_noops_1.0.0_lerobot --repo-type dataset
-
-export HF_CACHE_TEMP=/home/elijah/.cache/huggingface/
-ln -s ${HF_CACHE_TEMP}/hub/datasets--IPEC-COMMUNITY--libero_spatial_no_noops_1.0.0_lerobot/snapshots/cb7508999d4a8caa65b6448d6d700e1f347b809e ${HF_CACHE_TEMP}/lerobot/IPEC-COMMUNITY/libero_spatial_no_noops_1.0.0_lerobot
-```
- -->
+### Evaluation
+See [examples](examples/README.md) for details about evaluation in LIBERO and other simulation environments.

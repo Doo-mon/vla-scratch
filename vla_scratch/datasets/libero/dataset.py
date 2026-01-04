@@ -41,7 +41,11 @@ class LIBERODataset(torch.utils.data.Dataset):
                 np.linspace(-state_history, 0, state_history + 1, dtype=int) / fps
             ).tolist()
 
-        self.dataset = LeRobotDataset(repo_id=config.repo_id, delta_timestamps=delta_timestamps)
+        self.dataset = LeRobotDataset(
+            repo_id=config.repo_id,
+            delta_timestamps=delta_timestamps,
+            video_backend=config.video_backend,
+        )
         assert fps == self.dataset.fps
 
     def __len__(self):
