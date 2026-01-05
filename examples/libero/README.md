@@ -18,8 +18,9 @@ source .venv/bin/activate
 python scripts/serve_policy.py \
   policy=pi-qwen \
   policy.state_history=1 \
-  policy.action_horizon=20 \
-  data=libero-ipec-spatial \
+  policy.action_horizon=30 \
+  policy.transforms.0.max_length=180 \
+  data=libero-spatial \
   checkpoint_path=hf:elijahgalahad/libero_policy
 ```
 
@@ -28,5 +29,5 @@ Start sim client to eval policy:
 source examples/libero/.venv/bin/activate
 export LIBERO_ROOT=$(pwd)/../LIBERO
 export PYTHONPATH=$PYTHONPATH:$LIBERO_ROOT
-python examples/libero/eval_libero_policy.py host=127.0.0.1 port=8000 libero_task_suite=libero_spatial headless=false action_chunk_size=5 episodes_per_task=10
+python examples/libero/simulation.py host=127.0.0.1 port=8000 libero_task_suite=libero_spatial headless=false action_chunk_size=5 episodes_per_task=10
 ```

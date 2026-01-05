@@ -1,4 +1,4 @@
-# VL-Think policy rollouts
+# SimplerEnv Eval Example
 
 Simulator env setup (`examples/bbox_cotrain/.venv`):
 ```bash
@@ -28,5 +28,5 @@ Sim client (adapt BlindVLA batched eval to call the ZMQ server):
 ```bash
 source examples/bbox_cotrain/.venv/bin/activate
 
-python examples/bbox_cotrain/eval_bbox_cotrain.py render=true sim_backend=cpu port=8000 obj_set=train
+python examples/bbox_cotrain/simulation.py render=true sim_backend=cpu port=8000 obj_set=train
 ```

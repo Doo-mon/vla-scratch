@@ -37,7 +37,6 @@ dependencies = [
     "matplotlib",
     # the last commit before dataset version 3.0
     "lerobot @ git+https://github.com/huggingface/lerobot@v0.4.2",
-    "torchcodec",
     "accelerate",
     "mujoco",
     "viser",

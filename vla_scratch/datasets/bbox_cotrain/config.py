@@ -8,10 +8,6 @@ from vla_scratch.datasets.config import DataConfig
 
 @dataclass
 class CoTrainConfig(DataConfig):
-    """
-    Config for the BlindVLA LeRobot dataset.
-    """
-
     _target_: str = "vla_scratch.datasets.bbox_cotrain.dataset.CoTrainDataset"
     repo_id: str = "horipse01/lerobot_merged"
     root_path: Optional[Path] = None
@@ -23,9 +19,8 @@ class CoTrainConfig(DataConfig):
     # Regex filters applied to info.json splits keys (e.g., \".*banana.*\")
     splits: List[str] = field(default_factory=lambda: [".*"])
 
-    norm_stats_path: Optional[Path] = (
-        "normalization_stats/bbox_cotrain/lerobot_norm_stats-horizon_{data.action_horizon}-history_{data.state_history}.npz"
-    )
+    norm_stats_path: str = "hf:elijahgalahad/norm_stats-bbox-cotrain"
+    # norm_stats_path: str = "normalization_stats/bbox_cotrain/lerobot_norm_stats-horizon_24-history_0.npz"
 
 
 train_cotrain_config = CoTrainConfig(repo_id="horipse01/lerobot_merged_restricted")

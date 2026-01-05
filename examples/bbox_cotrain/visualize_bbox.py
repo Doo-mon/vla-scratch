@@ -85,17 +85,7 @@ def main(cfg: DictConfig) -> None:
 
     # Resolve checkpoint path (supports file or directory)
     if args.checkpoint_path is not None:
-        if isinstance(args.checkpoint_path, str) and args.checkpoint_path.startswith(
-            "hf:"
-        ):
-            ckpt = find_latest_checkpoint(args.checkpoint_path)
-        else:
-            cp = Path(args.checkpoint_path).resolve()
-            # If a directory is provided, pick latest matching checkpoint
-            if cp.is_dir():
-                ckpt = find_latest_checkpoint(cp)
-            else:
-                ckpt = cp
+        ckpt = find_latest_checkpoint(args.checkpoint_path)
         if ckpt is None:
             raise FileNotFoundError(f"No checkpoint found under {args.checkpoint_path}")
         print(f"Loading checkpoint: {ckpt}")

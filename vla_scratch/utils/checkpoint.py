@@ -62,8 +62,11 @@ def find_latest_checkpoint(path: Path | str, desired_iter: Optional[int] = None)
     - If `path` is a run directory, returns the newest checkpoint directory.
     - None if nothing is found.
     """
-    if isinstance(path, str) and path.startswith(_HF_PREFIX):
-        path = _resolve_hf_checkpoint_path(path)
+    if isinstance(path, str):
+        if path.startswith(_HF_PREFIX):
+            path = _resolve_hf_checkpoint_path(path)
+        else:
+            path = Path(path).expanduser().resolve()
     p = Path(path)
     if p.is_file():
         # If this is model.pt inside a checkpoint dir, prefer returning the dir

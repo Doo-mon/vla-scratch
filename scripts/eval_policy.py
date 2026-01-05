@@ -9,7 +9,6 @@ Evaluate a policy on a dataset using Hydra configs (mirrors train_policy grammar
 """
 
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, List, Optional, cast, TYPE_CHECKING
 import os
 from tqdm import tqdm
@@ -29,7 +28,6 @@ from vla_scratch.utils.checkpoint import (
     find_latest_checkpoint,
     load_model_from_checkpoint,
 )
-from vla_scratch.utils.config import merge_cfg_from_checkpoint
 from vla_scratch.helpers.training import eval_sample_mse
 
 if TYPE_CHECKING:
@@ -97,17 +95,7 @@ def main(cfg: DictConfig) -> None:
     model.compute_loss(sample0.to(device))
 
     if eval_cfg.checkpoint_path is not None:
-        if isinstance(eval_cfg.checkpoint_path, str) and eval_cfg.checkpoint_path.startswith(
-            "hf:"
-        ):
-            ckpt = find_latest_checkpoint(eval_cfg.checkpoint_path)
-        else:
-            cp = Path(eval_cfg.checkpoint_path).resolve()
-            # If a directory is provided, pick latest matching checkpoint
-            if cp.is_dir():
-                ckpt = find_latest_checkpoint(cp)
-            else:
-                ckpt = cp
+        ckpt = find_latest_checkpoint(eval_cfg.checkpoint_path)
         if ckpt is None:
             raise FileNotFoundError(f"No checkpoint found under {eval_cfg.checkpoint_path}")
         print(f"Loading checkpoint: {ckpt}")

@@ -191,6 +191,7 @@ class CoTrainDataset(torch.utils.data.Dataset):
             root=meta_root,
             delta_timestamps=delta_timestamps,
             episodes=episodes,
+            video_backend=config.video_backend,
         )
         time_end = time.time()
         print(f"Initialized LeRobotDataset with {len(self.dataset)} samples in {time_end - time_start:.2f}s")
@@ -245,7 +246,7 @@ class CoTrainDataset(torch.utils.data.Dataset):
         img = item["observation.images.image"]
         actions = item["actions"]  # shape: (action_horizon, action_dim)
 
-        state_len = self.state_history + 1
+        state_len = self.state_history
 
         ep_idx = int(item["episode_index"].item())
         frame_idx = int(item["frame_index"].item())

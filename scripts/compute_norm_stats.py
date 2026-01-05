@@ -16,7 +16,10 @@ Examples:
 """
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, cast, TYPE_CHECKING
+import shutil
+import tempfile
 from tqdm import tqdm
 
 
@@ -38,6 +41,8 @@ from vla_scratch.transforms.normalization import (
     NormStats,
     FieldNormStats,
 )
+from vla_scratch.utils.config import resolve_config_placeholders
+from vla_scratch.utils.paths import REPO_ROOT
 
 if TYPE_CHECKING:
     from vla_scratch.transforms.data_types import DataSample
@@ -51,7 +56,7 @@ class NormStatsConfig:
     policy: PolicyConfig = MISSING
 
     # Compute controls
-    num_samples: int = 4096
+    num_samples: int = 16384
     batch_size: int = 32
     num_workers: int = 8
     pin_memory: bool = False
@@ -68,7 +73,8 @@ def compute_and_save_norm_stats(
     batch_size: int,
     num_workers: int,
     pin_memory: bool,
-) -> NormStats:
+    output_dir: Path,
+) -> tuple["DataSample", NormStats, Path]:
     dataset = create_dataset(data_config, policy_config, skip_norm_stats=True, skip_policy_transforms=True)
     dataset_size = len(dataset)
 
@@ -114,9 +120,9 @@ def compute_and_save_norm_stats(
         PROCESSED_ACTION_KEY: _compute_norm_stats_for_tensor(action_tensor),
     }
 
-    stats_path = save_norm_stats(data_config, policy_config, stats)
+    stats_path = save_norm_stats(output_dir, data_config, policy_config, stats)
     print(f"Saved normalization stats to: {stats_path}")
-    return stacked, stats
+    return stacked, stats, stats_path
 
 
 @hydra.main(config_name="norm_stats", version_base=None)
@@ -137,14 +143,69 @@ def main(cfg: DictConfig) -> None:
         f"(horizon={data_cfg.action_horizon}, history={data_cfg.state_history})"
     )
 
-    _, _ = compute_and_save_norm_stats(
+    temp_dir = Path(tempfile.mkdtemp(prefix="norm_stats-", dir="/tmp"))
+    OmegaConf.save(OmegaConf.structured(run_cfg), temp_dir / "cfg.yaml")
+
+    _, _, _ = compute_and_save_norm_stats(
         data_cfg,
         policy_cfg,
         num_samples=int(cfg.num_samples),
         batch_size=int(cfg.batch_size),
         num_workers=int(cfg.num_workers),
         pin_memory=bool(cfg.pin_memory),
+        output_dir=temp_dir,
     )
+
+    resolved_path = resolve_config_placeholders(
+        data_cfg.norm_stats_path, data_cfg=data_cfg, policy_cfg=policy_cfg
+    )
+    if resolved_path is None:
+        raise ValueError("DataConfig.norm_stats_path must be set to save stats.")
+
+    if str(resolved_path).startswith("hf:"):
+        from huggingface_hub import HfApi, get_token
+
+        raw = str(resolved_path)[len("hf:"):]
+        parts = raw.split("/", 2)
+        if len(parts) >= 2:
+            repo_id = "/".join(parts[:2])
+            subpath = parts[2] if len(parts) == 3 else ""
+        else:
+            repo_id = raw
+            subpath = ""
+
+        revision = None
+        if "@" in repo_id:
+            repo_id, revision = repo_id.split("@", 1)
+
+        api = HfApi(token=get_token())
+        last_exc: Exception | None = None
+        for repo_type in ("dataset", "model"):
+            try:
+                api.create_repo(repo_id=repo_id, repo_type=repo_type, exist_ok=True)
+                api.upload_folder(
+                    repo_id=repo_id,
+                    repo_type=repo_type,
+                    folder_path=str(temp_dir),
+                    path_in_repo=subpath or "",
+                    revision=revision,
+                )
+                print(f"Uploaded normalization stats to hf:{repo_id}")
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+        assert last_exc is not None
+        raise last_exc
+
+    target_dir = Path(str(resolved_path)).expanduser()
+    if not target_dir.is_absolute():
+        target_dir = REPO_ROOT / target_dir
+    target_dir = target_dir.resolve()
+    if target_dir.exists():
+        raise FileExistsError(f"Target norm stats path already exists: {target_dir}")
+    target_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(temp_dir), str(target_dir))
+    print(f"Moved normalization stats to: {target_dir}")
 
 
 if __name__ == "__main__":

@@ -146,17 +146,8 @@ def main(cfg: DictConfig) -> None:
 
     # Resolve checkpoint path (supports file or directory)
     if train_cfg.checkpoint_path is not None:
-        if isinstance(train_cfg.checkpoint_path, str) and train_cfg.checkpoint_path.startswith("hf:"):
-            latest = find_latest_checkpoint(train_cfg.checkpoint_path)
-            train_cfg.checkpoint_path = latest if latest is not None else None
-        else:
-            cp = Path(train_cfg.checkpoint_path).resolve()
-            # If a directory is provided, pick latest matching checkpoint
-            if cp.is_dir():
-                latest = find_latest_checkpoint(cp)
-                train_cfg.checkpoint_path = latest if latest is not None else None
-            else:
-                train_cfg.checkpoint_path = cp
+        latest = find_latest_checkpoint(train_cfg.checkpoint_path)
+        train_cfg.checkpoint_path = latest if latest is not None else None
 
     # create timestamped output directory with exp_name
     now = datetime.datetime.now()

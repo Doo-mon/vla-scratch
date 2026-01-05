@@ -18,7 +18,7 @@ from omegaconf import DictConfig, OmegaConf
 
 import sys
 sys.path.append(".")
-from vla_scratch.serving.zmq_policy_client import ZmqPolicyClient
+from vla_scratch.utils.serving.zmq_policy_client import ZmqPolicyClient
 from vla_scratch.transforms.data_keys import (
     PROCESSED_ACTION_KEY,
     PROCESSED_IMAGE_KEY,

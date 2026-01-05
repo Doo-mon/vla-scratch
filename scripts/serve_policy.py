@@ -26,7 +26,6 @@ from vla_scratch.utils.checkpoint import (
     find_latest_checkpoint,
     load_model_from_checkpoint,
 )
-from vla_scratch.utils.config import merge_cfg_from_checkpoint
 from vla_scratch.datasets.libero_global.data_keys import (
     ARM_STATE_CART_POS_KEY,
     ARM_STATE_CART_ROT_KEY,
@@ -36,7 +35,7 @@ from vla_scratch.datasets.libero_global.data_keys import (
     TASK_NAME_KEY,
 )
 
-from vla_scratch.serving.zmq_policy_server import ZmqPolicyServer
+from vla_scratch.utils.serving.zmq_policy_server import ZmqPolicyServer
 from vla_scratch.transforms.common import ToTorch, ToNumpy
 
 if TYPE_CHECKING:

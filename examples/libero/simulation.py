@@ -26,7 +26,7 @@ import numpy as np
 import robosuite as suite
 import robosuite.utils.transform_utils as T
 
-from vla_scratch.serving.zmq_policy_client import ZmqPolicyClient
+from vla_scratch.utils.serving.zmq_policy_client import ZmqPolicyClient
 from vla_scratch.transforms.data_keys import (
     PROCESSED_IMAGE_KEY,
     PROCESSED_IMAGE_MASK_KEY,

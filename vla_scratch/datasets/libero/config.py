@@ -8,9 +8,7 @@ from hydra.core.config_store import ConfigStore
 class LiberoConfig(DataConfig):
     _target_: str = "vla_scratch.datasets.libero.dataset.LIBERODataset"
     repo_id: str = "elijahgalahad/libero_spatial_noops_v30"
-    norm_stats_path: str = (
-        "normalization_stats/libero/lerobot-horizon_{data.action_horizon}-history_{data.state_history}.npz"
-    )
+    norm_stats_path: str = "hf:elijahgalahad/norm_stats-libero-spatial"
 
 
 libero_spatial_config = LiberoConfig()

@@ -24,18 +24,16 @@ Usage:
         max_episodes=100
 """
 
-import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Optional, Tuple, cast
 
 import einops
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
-import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import hydra
 from hydra.core.config_store import ConfigStore
@@ -45,20 +43,19 @@ from vla_scratch.policies.config import PolicyConfig, create_policy
 from vla_scratch.datasets.config import DataConfig
 from vla_scratch.utils.checkpoint import find_latest_checkpoint, load_model_from_checkpoint
 from vla_scratch.transforms.data_types import Observation, DataSample
-from vla_scratch.transforms.common import ToDataSample, ToTorch
-from vla_scratch.policies.modules.vlm_bridge.qwen.processor import QwenProcessor
+from vla_scratch.transforms.common import ToTorch
 from vla_scratch.policies.modules.vlm_bridge.qwen.bridge import Qwen3VLBridge
 from vla_scratch.helpers.data import build_input_transforms, create_dataset
+from vla_scratch.transforms.data_keys import (
+    PROCESSED_IMAGE_KEY,
+    PROCESSED_IMAGE_MASK_KEY,
+    PROCESSED_STATE_KEY,
+    TASK_KEY,
+    GENERATION_PROMPT_KEY,
+    GENERATION_ANSWER_KEY,
+)
 
-try:
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-except ImportError:
-    # Try alternative import path
-    try:
-        from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-    except ImportError:
-        raise ImportError("Could not import LeRobotDataset. Please install lerobot package.")
-
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 def compute_attention_weights(
     q: torch.Tensor,
@@ -92,10 +89,12 @@ def compute_attention_weights(
     return attn_weights
 
 
+@torch.inference_mode()
 def extract_attention_from_bridge(
     bridge: Qwen3VLBridge,
     observation: Observation,
     layer_idx: int = -1,  # Last layer by default
+    subtext: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Extract attention weights from the VLM bridge.
@@ -271,7 +270,56 @@ def extract_attention_from_bridge(
     
     # Create text mask (opposite of image mask, but only for valid tokens)
     text_mask = ~image_mask & input_pad_mask.bool()  # [batch, seq_len]
-    
+
+    if subtext:
+        tokenizer = getattr(bridge.processor, "tokenizer", None)
+        if tokenizer is not None:
+            def _find_subtext_mask(
+                input_ids: torch.Tensor,
+                attention_mask: torch.Tensor,
+                valid_text_mask: torch.Tensor,
+                subtext_value: str,
+            ) -> Optional[torch.Tensor]:
+                subtext_value = subtext_value.strip()
+                if not subtext_value:
+                    return None
+
+                candidates = []
+                base_ids = tokenizer.encode(subtext_value, add_special_tokens=False)
+                if base_ids:
+                    candidates.append(base_ids)
+                if not subtext_value.startswith(" "):
+                    spaced_ids = tokenizer.encode(f" {subtext_value}", add_special_tokens=False)
+                    if spaced_ids:
+                        candidates.append(spaced_ids)
+
+                if not candidates:
+                    return None
+
+                mask = torch.zeros_like(attention_mask, dtype=torch.bool)
+                for b in range(input_ids.shape[0]):
+                    valid_positions = torch.where(attention_mask[b].bool())[0].tolist()
+                    tokens = input_ids[b, valid_positions].tolist()
+                    for cand in candidates:
+                        if len(cand) > len(tokens):
+                            continue
+                        for start in range(len(tokens) - len(cand) + 1):
+                            if tokens[start : start + len(cand)] == cand:
+                                orig_indices = valid_positions[start : start + len(cand)]
+                                if all(valid_text_mask[b, idx].item() for idx in orig_indices):
+                                    mask[b, orig_indices] = True
+
+                return mask if mask.any() else None
+
+            subtext_mask = _find_subtext_mask(
+                input_ids=input_ids,
+                attention_mask=input_pad_mask,
+                valid_text_mask=text_mask,
+                subtext_value=subtext,
+            )
+            if subtext_mask is not None:
+                text_mask = subtext_mask
+
     return attn_weights, image_mask, text_mask
 
 
@@ -298,25 +346,14 @@ def map_attention_to_image(
         attention_map: [height, width] - attention scores mapped to image space
     """
     # Ensure we have batch dimension
-    if attention_weights.ndim == 3:
-        # [num_heads, seq_len, seq_len] - add batch dim
-        attention_weights = attention_weights.unsqueeze(0)
-    elif attention_weights.ndim == 4:
-        # [batch, num_heads, seq_len, seq_len] - correct
-        pass
-    else:
-        raise ValueError(f"Unexpected attention_weights shape: {attention_weights.shape}")
-    
+    assert attention_weights.ndim == 4
     # Average over heads and batch (assuming batch_size=1)
     attn = attention_weights[0].mean(dim=0)  # [seq_len, seq_len]
     
     # Get image token indices (should already have batch dimension)
     # image_mask and text_mask should be [batch, seq_len] after unsqueeze(0)
-    if image_mask.ndim == 1:
-        image_mask = image_mask.unsqueeze(0)
-    if text_mask.ndim == 1:
-        text_mask = text_mask.unsqueeze(0)
-    
+    assert image_mask.ndim == 2
+    assert text_mask.ndim == 2
     image_token_indices = torch.where(image_mask[0])[0]
     text_token_indices = torch.where(text_mask[0])[0]
     
@@ -327,6 +364,8 @@ def map_attention_to_image(
     # Extract attention from text tokens to image tokens
     # attn[text_idx, image_idx] gives how much each text token attends to each image token
     text_to_image_attn = attn[text_token_indices][:, image_token_indices]  # [num_text, num_image_tokens]
+    # normalize over image tokens
+    text_to_image_attn = text_to_image_attn / (text_to_image_attn.sum(dim=-1, keepdim=True) + 1e-8)
     
     # Average over all text tokens to get per-image-token attention
     image_token_attn = text_to_image_attn.mean(dim=0)  # [num_image_tokens]
@@ -430,7 +469,7 @@ def map_attention_to_image(
 
 
 def visualize_attention(
-    image: np.ndarray,
+    img_chw: np.ndarray,
     attention_map: np.ndarray,
     output_path: str,
     instruction: Optional[str] = None,
@@ -440,7 +479,7 @@ def visualize_attention(
     Visualize attention map overlaid on the original image.
     
     Args:
-        image: Original image [H, W, 3] in uint8
+        img_chw: Original image [3, H, W] in uint8
         attention_map: Attention map [H, W] in float32
         output_path: Path to save visualization
         instruction: Optional text instruction to display on the image
@@ -460,19 +499,12 @@ def visualize_attention(
     attn_colored = (attn_colored * 255).astype(np.uint8)
     
     # Overlay on original image
-    if image.dtype != np.uint8:
-        if image.max() <= 1.0:
-            image = (image * 255).astype(np.uint8)
-        else:
-            image = image.astype(np.uint8)
-    
+    img_hwc = img_chw.transpose(1, 2, 0)  # [H, W, 3]
     # Ensure same shape
-    if image.shape[:2] != attn_colored.shape[:2]:
-        attn_colored = np.array(Image.fromarray(attn_colored).resize(
-            (image.shape[1], image.shape[0]), Image.Resampling.BILINEAR
-        ))
+    if attn_colored.shape[:2] != img_hwc.shape[:2]:
+        attn_colored = np.array(Image.fromarray(attn_colored).resize((img_hwc.shape[1], img_hwc.shape[0]), Image.Resampling.BILINEAR))
     
-    overlay = (alpha * attn_colored + (1 - alpha) * image).astype(np.uint8)
+    overlay = (alpha * attn_colored + (1 - alpha) * img_hwc).astype(np.uint8)
     
     # Convert to PIL Image for text drawing
     img_pil = Image.fromarray(overlay)
@@ -669,10 +701,8 @@ class VisualizeAttentionConfig:
     checkpoint_path: Optional[str] = None
 
     # visualization parameters
-    dataset_root: str = MISSING  # Path to LeRobotDataset root directory
-    dataset_repo_id: Optional[str] = None  # Optional repo_id for LeRobotDataset (auto-detected if None)
     output_dir: str = "attention_visualizations"  # Output directory for all visualizations
-    layer_idx: int = -1  # Last layer by default
+    layer_idx: int = 6  # Last layer by default
     max_episodes: Optional[int] = None  # Limit number of episodes to process (None = all)
 
 
@@ -719,11 +749,12 @@ def main(cfg: DictConfig) -> None:
     print("Initializing model...")
     with torch.device(device):
         model = create_policy(args.policy)
+    model.eval()
     print("Model initialized.")
 
-    # Load latest checkpoint
+    # Resolve checkpoint path (supports file or directory)
     if args.checkpoint_path is not None:
-        ckpt = find_latest_checkpoint(Path(args.checkpoint_path))
+        ckpt = find_latest_checkpoint(args.checkpoint_path)
         if ckpt is None:
             raise FileNotFoundError(
                 f"No checkpoint found under {args.checkpoint_path}"
@@ -750,32 +781,9 @@ def main(cfg: DictConfig) -> None:
 
     # Build input transforms to get the processor
     input_transforms = [ToTorch()] + build_input_transforms(args.data, args.policy)
-    
-    # Find QwenProcessor in transforms
-    processor = None
-    for transform in input_transforms:
-        if isinstance(transform, QwenProcessor):
-            processor = transform
-            break
-    
-    if processor is None:
-        # Fallback: create processor manually
-        model_id = getattr(bridge.processor, 'name_or_path', None) or \
-                   getattr(bridge.causal_model.config, 'name_or_path', None) or \
-                   "Qwen/Qwen2-VL-2B-Instruct"
-        processor = QwenProcessor(
-            processor_class="Qwen3VLProcessor",
-            model_id=model_id,
-            max_length=256,
-            padding="max_length",
-        )
 
     # Load LeRobotDataset
-    print(f"Loading LeRobotDataset from {args.dataset_root}...")
-    dataset_kwargs = {"root": args.dataset_root}
-    if args.dataset_repo_id:
-        dataset_kwargs["repo_id"] = args.dataset_repo_id
-    dataset = LeRobotDataset(**dataset_kwargs)
+    dataset: "LeRobotDataset" = dataset.base_dataset.dataset
     print(f"Dataset loaded: {dataset.num_episodes} episodes, {dataset.num_frames} frames")
     
     # Create output directory
@@ -788,7 +796,7 @@ def main(cfg: DictConfig) -> None:
     if args.max_episodes is not None:
         num_episodes = min(num_episodes, args.max_episodes)
     
-    print(f"Processing {num_episodes} episodes...")
+    print(f"Processing {num_episodes} episodes (all frames)...")
     
     # Get image key from dataset
     image_key = "observation.images.image"
@@ -805,116 +813,61 @@ def main(cfg: DictConfig) -> None:
     # Process each episode
     for episode_idx in range(num_episodes):
         print(f"\nProcessing episode {episode_idx}...")
-        
-        try:
-            # Get first frame index of this episode
-            if hasattr(dataset, 'episode_data_index'):
-                first_frame_idx = dataset.episode_data_index["from"][episode_idx].item()
-            elif hasattr(dataset.meta, 'episodes'):
-                first_frame_idx = dataset.meta.episodes["dataset_from_index"][episode_idx]
-            else:
-                # Fallback: assume episodes are sequential
-                # This is a rough estimate, may not be accurate
-                frames_per_episode = dataset.num_frames // dataset.num_episodes
-                first_frame_idx = episode_idx * frames_per_episode
-            
-            # Get first frame data
-            frame_data = dataset[first_frame_idx]
-            
+
+        start_idx = dataset.meta.episodes["dataset_from_index"][
+            episode_idx
+        ]
+        end_idx = dataset.meta.episodes["dataset_to_index"][
+            episode_idx
+        ]
+
+        for frame_idx in range(start_idx, end_idx + 1):
+            frame_data = dataset[frame_idx]
+
             # Extract image and instruction
             img_tensor = frame_data[image_key]
-            
+
             # Get instruction/task - LeRobotDataset adds "task" field in __getitem__
             instruction = frame_data.get("task", "")
-            if not instruction:
-                # Try to get from task_index
-                task_idx = frame_data.get("task_index")
-                if task_idx is not None:
-                    task_idx_val = task_idx.item() if isinstance(task_idx, torch.Tensor) else task_idx
-                    if hasattr(dataset.meta, 'tasks'):
-                        tasks = dataset.meta.tasks
-                        if isinstance(tasks, (list, tuple)):
-                            if task_idx_val < len(tasks):
-                                instruction = tasks[task_idx_val]
-                        elif hasattr(tasks, 'iloc'):  # pandas DataFrame/Series
-                            if task_idx_val < len(tasks):
-                                instruction = tasks.iloc[task_idx_val].name if hasattr(tasks.iloc[task_idx_val], 'name') else str(tasks.iloc[task_idx_val])
-                        elif hasattr(tasks, '__getitem__'):
-                            try:
-                                instruction = tasks[task_idx_val]
-                            except (IndexError, KeyError):
-                                pass
-            
-            if not instruction:
-                instruction = f"Episode {episode_idx}"
-            
+
             # Extract object name from instruction
             object_name = extract_object_name(instruction)
             print(f"  Full instruction: {instruction}")
             print(f"  Extracted object name: {object_name}")
-            
+
             # Use object name as the input for the model
-            model_input_instruction = object_name
-            
-            # Convert image to numpy
-            image = convert_lerobot_image_to_numpy(img_tensor)
-            original_shape = image.shape[:2]  # (H, W)
-            
-            # Convert image to format expected by transforms (same as build_payload)
-            # Image should be in CHW format: (3, H, W) as numpy array
-            if image.dtype != np.uint8:
-                if image.max() <= 1.0:
-                    image = (image * 255.0).astype(np.uint8)
-                else:
-                    image = image.astype(np.uint8)
-            
-            # Convert to CHW format: (3, H, W)
-            img_chw = np.transpose(image, (2, 0, 1))  # (H, W, 3) -> (3, H, W)
-            
+            model_input_instruction = instruction
+
+            img_chw = (img_tensor * 255).type(torch.uint8).cpu().numpy()
+            original_shape = img_chw.shape[1:]  # (H, W)
+
             # Create payload dict (same format as build_payload and serve_policy input)
-            from vla_scratch.transforms.data_keys import (
-                PROCESSED_IMAGE_KEY,
-                PROCESSED_IMAGE_MASK_KEY,
-                PROCESSED_STATE_KEY,
-                TASK_KEY,
-                GENERATION_PROMPT_KEY,
-                GENERATION_ANSWER_KEY,
-            )
-            
             payload = {
                 PROCESSED_IMAGE_KEY: img_chw,  # (3, H, W) - will be processed by transforms
                 PROCESSED_IMAGE_MASK_KEY: np.ones((1,), dtype=bool),
                 PROCESSED_STATE_KEY: np.zeros((args.policy.state_history + 1, args.policy.state_dim or 1), dtype=np.float32),
-                TASK_KEY: model_input_instruction,  # Use extracted object name instead of full instruction
+                TASK_KEY: model_input_instruction,
                 GENERATION_PROMPT_KEY: "",
                 GENERATION_ANSWER_KEY: "",
             }
-            
+
             # Process through transforms (same as serve_policy.py)
             data_sample = payload
             for transform in input_transforms:
-                data_sample = transform.compute(data_sample)
-            
-            # Now data_sample should be a DataSample
-            if not isinstance(data_sample, DataSample):
-                raise ValueError(f"Expected DataSample after transforms, got {type(data_sample)}")
-            
+                data_sample: "DataSample" = transform.compute(data_sample)
+
             # Move to device and add batch dimension (same as serve_policy.py line 147)
             data_sample = data_sample.to(device).unsqueeze(0)
-            
-            # Extract observation
-            sample = data_sample
 
-            # Extract attention
-            with torch.no_grad():
-                attn_weights, image_mask, text_mask = extract_attention_from_bridge(
-                    bridge,
-                    sample.observation,
-                    layer_idx=args.layer_idx,
-                )
+            attn_weights, image_mask, text_mask = extract_attention_from_bridge(
+                bridge,
+                data_sample.observation,
+                layer_idx=args.layer_idx,
+                subtext=object_name,
+            )
 
             # Get image grid info
-            policy_input = sample.observation.policy_input
+            policy_input = data_sample.observation.policy_input
             image_grid_thw = policy_input.image_grid_thw
 
             # Get spatial merge size from vision model
@@ -935,18 +888,24 @@ def main(cfg: DictConfig) -> None:
             # Visualize and save
             # Display both full instruction and extracted object name for clarity
             display_text = f"{instruction}\n(Object: {object_name})"
-            output_path = output_dir / f"episode_{episode_idx}.png"
-            visualize_attention(image, attention_map, str(output_path), instruction=display_text)
+            ep_idx = (
+                int(frame_data["episode_index"].item())
+                if "episode_index" in frame_data
+                else episode_idx
+            )
+            frame_idx_in_ep = (
+                int(frame_data["frame_index"].item())
+                if "frame_index" in frame_data
+                else (frame_idx - start_idx)
+            )
+            episode_dir = output_dir / f"episode_{ep_idx}"
+            episode_dir.mkdir(parents=True, exist_ok=True)
+            output_path = episode_dir / f"frame_{frame_idx_in_ep}.png"
+            visualize_attention(img_chw, attention_map, str(output_path), instruction=display_text)
             
-        except Exception as e:
-            print(f"Error processing episode {episode_idx}: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
 
     print(f"\nDone! Processed {num_episodes} episodes. Results saved to {output_dir}")
 
 
 if __name__ == "__main__":
     main()
-

@@ -4,8 +4,6 @@ from omegaconf import DictConfig, OmegaConf
 import importlib
 import re
 
-from vla_scratch.utils.checkpoint import find_latest_checkpoint
-
 
 def locate_class(target: str) -> type:
     """Import and return a class/function given a fully-qualified path string.
@@ -57,33 +55,3 @@ def save_train_config(cfg: DictConfig, run_dir: Path) -> Path:
     OmegaConf.save(cfg, train_cfg_path)
     return train_cfg_path
 
-
-def merge_cfg_from_checkpoint(
-    cfg: DictConfig,
-    checkpoint_path: Optional[Path | str],
-) -> DictConfig:
-    """Merge saved train config from a checkpoint run directory into `cfg`."""
-    if checkpoint_path is None:
-        return cfg
-    try:
-        ckpt = find_latest_checkpoint(checkpoint_path)
-    except Exception:
-        ckpt = None
-    if ckpt is None:
-        return cfg
-
-    run_dir = Path(ckpt).parent
-    train_cfg_path = run_dir / "train-cfg.yaml"
-    if not train_cfg_path.exists():
-        return cfg
-    try:
-        saved_cfg = OmegaConf.load(train_cfg_path)
-    except Exception:
-        return cfg
-    saved_policy = saved_cfg["policy"]
-    saved_data = saved_cfg["data"]
-    cfg["policy"] = OmegaConf.merge(cfg["policy"], saved_policy)
-    cfg["data"] = OmegaConf.merge(cfg["data"], saved_data)
-    return cfg
-    
-    
