@@ -3,8 +3,6 @@ from __future__ import annotations
 import time
 from typing import Tuple, TYPE_CHECKING, Dict
 
-import einops
-import jaxtyping as at
 import torch
 import torch.nn as nn
 from torch.distributed.fsdp._fully_shard import (
@@ -13,35 +11,35 @@ from torch.distributed.fsdp._fully_shard import (
     register_fsdp_forward_method,
 )
 
+from tensordict import TensorClass
+
+import einops
+import jaxtyping as at
+
 from vla_scratch.policies.base import BasePolicy
-from vla_scratch.policies.modules.action_expert.cross_attention_dit import (
-    DiTModel as CrossAttentionDiTModel,
-)
+from vla_scratch.policies.modules.action_expert.cross_attention_dit import DiTModel
 from vla_scratch.policies.modules.vlm_bridge.paligemma.bridge import PaligemmaBridge
 from vla_scratch.policies.modules.vlm_bridge.qwen.bridge import Qwen3VLBridge
+
 from vla_scratch.policies.utils.training import (
     apply_checkpoint_when_training,
     fully_shard_layers,
 )
 from vla_scratch.policies.utils.diffusion import (
     build_beta_time_dist,
-    repeat_batch,
     sample_clamped_time,
-    sample_topk_noise,
+    repeat_batch,
+    sample_noise,
 )
 from vla_scratch.policies.utils.transformers import (
     create_sinusoidal_pos_embedding,
     make_att_2d_masks,
-    sample_noise,
 )
 
 if TYPE_CHECKING:
-    from vla_scratch.policies.modules.vlm_bridge.data_types import VLMOutputs
+    from vla_scratch.policies.modules.vlm_bridge.base import VLMOutputs
     from vla_scratch.policies.pi.config import PiConfig
     from vla_scratch.transforms.data_types import Observation, DataSample
-
-
-from tensordict import TensorClass
 
 
 class SuffixInput(TensorClass):
@@ -56,11 +54,6 @@ class PiPolicy(BasePolicy):
     def __init__(self, config: "PiConfig"):
         super().__init__()
         self.config = config
-
-        if config.num_noise_before_topk < config.num_noise_per_sample:
-            raise ValueError(
-                "num_noise_before_topk must be >= num_noise_per_sample for top-k selection"
-            )
 
         if config.action_dim is None or config.state_dim is None:
             raise ValueError(
@@ -80,9 +73,6 @@ class PiPolicy(BasePolicy):
             self.vlm_bridge = Qwen3VLBridge(
                 model_id=config.model_id,
                 vlm_type=config.vlm_type,
-                use_grid_thw_list=config.qwen3_vl_use_grid_thw_list,
-                recompute_pos_ids=config.qwen3_vl_recompute_pos_ids,
-                masked_add_stack=config.qwen3_vl_masked_add_stack,
             )
         else:
             raise NotImplementedError(
@@ -111,14 +101,16 @@ class PiPolicy(BasePolicy):
             self.obs_registers_att_masks = torch.zeros(
                 config.num_obs_registers, dtype=torch.bool
             )
-            self.obs_registers_att_masks[0] = 1 # prevent prefix from attending to registers
+            self.obs_registers_att_masks[0] = (
+                1  # prevent prefix from attending to registers
+            )
         else:
             assert (
                 not config.expert_only_use_register
             ), "expert_only_use_register must be False when num_obs_registers is 0."
         action_expert_config = config.action_expert_cfg
         start_time = time.time()
-        self.action_expert = CrossAttentionDiTModel(config=action_expert_config)
+        self.action_expert = DiTModel(config=action_expert_config)
         end_time = time.time()
         print(f"Action expert initialized in {end_time - start_time:.2f} seconds.")
 
@@ -161,17 +153,21 @@ class PiPolicy(BasePolicy):
         )
 
     def initialize_weights(self):
-        # nn.init.xavier_uniform_(self.state_in_proj.weight)
-        # nn.init.zeros_(self.state_in_proj.bias)
-        # nn.init.xavier_uniform_(self.action_in_proj.weight)
-        # nn.init.zeros_(self.action_in_proj.bias)
-        # nn.init.xavier_uniform_(self.action_out_proj.weight)
-        # nn.init.zeros_(self.action_out_proj.bias)
         if self.config.suffix_add_pos_emb:
-            nn.init.normal_(self.position_embedding_state, mean=0.0, std=self.config.suffix_pos_emb_init_gain)
-            nn.init.normal_(self.position_embedding_action, mean=0.0, std=self.config.suffix_pos_emb_init_gain)
+            nn.init.normal_(
+                self.position_embedding_state,
+                mean=0.0,
+                std=self.config.suffix_pos_emb_init_gain,
+            )
+            nn.init.normal_(
+                self.position_embedding_action,
+                mean=0.0,
+                std=self.config.suffix_pos_emb_init_gain,
+            )
         if self.use_obs_register:
-            nn.init.normal_(self.obs_registers, mean=0.0, std=self.config.obs_register_init_gain)
+            nn.init.normal_(
+                self.obs_registers, mean=0.0, std=self.config.obs_register_init_gain
+            )
         self.action_expert.initialize_weights()
 
     def apply_fsdp(self, param_type, reduce_type, output_dtype, mesh):
@@ -299,20 +295,10 @@ class PiPolicy(BasePolicy):
 
         if data_sample.action_chunk is not None:
             suffix_input = self.construct_suffix_input(vlm_outputs)
-            if self.config.detach_kv_cache:
+            if self.config.detach_encoder_output:
                 torch.cuda.nvtx.range_push("Detach KV Cache")
                 suffix_input = suffix_input.detach()
                 torch.cuda.nvtx.range_pop()
-
-            torch.cuda.nvtx.range_push("Noise Sampling")
-            actions = data_sample.action_chunk.actions
-            selected_noise = sample_topk_noise(
-                actions,
-                self.config.num_noise_before_topk,
-                self.config.num_noise_per_sample,
-                device=actions.device,
-            )
-            torch.cuda.nvtx.range_pop()
 
             torch.cuda.nvtx.range_push("Expand Data Sample")
             data_sample = repeat_batch(data_sample, self.config.num_noise_per_sample)
@@ -321,13 +307,14 @@ class PiPolicy(BasePolicy):
 
             torch.cuda.nvtx.range_push("Apply Noise")
             actions = data_sample.action_chunk.actions
+            selected_noise = sample_noise(actions.shape, actions.device, actions.dtype)
             u_t = selected_noise - actions
             timestep = sample_clamped_time(self.time_dist, data_sample.shape)
             noisy_actions = actions + timestep[:, None, None] * u_t
             torch.cuda.nvtx.range_pop()
 
             torch.cuda.nvtx.range_push("Model Predict Suffix")
-            disp_loss, v_t, log_dict_suffix = self.predict_suffix(
+            _, v_t, log_dict_suffix = self.predict_suffix(
                 state=data_sample.observation.state,
                 suffix_input=suffix_input,
                 noisy_actions=noisy_actions,
@@ -341,14 +328,9 @@ class PiPolicy(BasePolicy):
             log_dict_suffix["loss/flow_mse"] = flow_mse.detach()
         else:
             flow_mse = 0.0
-            disp_loss = 0.0
             log_dict_suffix = {}
 
-        loss = (
-            flow_mse
-            + self.config.ce_loss_weight * ce_loss
-            + self.config.disp_loss_weight * disp_loss
-        )
+        loss = flow_mse + self.config.ce_loss_weight * ce_loss
 
         log_dict = {**log_dict_prefix, **log_dict_suffix}
 

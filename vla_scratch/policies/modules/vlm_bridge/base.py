@@ -4,23 +4,23 @@ from typing import Dict, Optional, Tuple, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
-
-from vla_scratch.policies.modules.vlm_bridge.data_types import VLMOutputs
+from tensordict import TensorClass
+import jaxtyping as at
 
 if TYPE_CHECKING:
     from vla_scratch.transforms.data_types import Observation
 
 TARGET_IGNORE_ID = -100
 
+
+class VLMOutputs(TensorClass):
+    last_hidden_state: at.Float[torch.Tensor, "*b seq_len hidden"]
+    prefix_pad_masks: at.Bool[torch.Tensor, "*b seq_len"]
+    key_states: at.Float[torch.Tensor, "*b n_layer n_head seq_len head_dim"]
+    value_states: at.Float[torch.Tensor, "*b n_layer n_head seq_len head_dim"]
+    hidden_state_list: at.Float[torch.Tensor, "*b n_layer seq_len hidden"]
+
 class VLMBridge(nn.Module):
-    """Abstract base class for VLM bridges.
-
-    Responsibilities:
-      - Handle model-specific preprocessing (tokenization/vision).
-      - Run the VLM transformer forward with optional checkpointing.
-      - Return (hidden_states, prefix_pad_masks, kv_cache_list).
-    """
-
     causal_model: nn.Module
 
     def get_text_dims(self) -> Tuple[int, int, int]:

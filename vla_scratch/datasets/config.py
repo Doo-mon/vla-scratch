@@ -13,7 +13,7 @@ class DataConfig:
     _target_: str
     action_horizon: Optional[int] = None
     state_history: Optional[int] = None
-    video_backend: Optional[str] = "pyav"
+    video_backend: Optional[str] = None
     # Structured transform lists
     input_transforms: List[Any] = field(default_factory=list)
     output_transforms: List[Any] = field(default_factory=list)

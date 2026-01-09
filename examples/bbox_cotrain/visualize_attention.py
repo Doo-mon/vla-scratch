@@ -136,7 +136,7 @@ def extract_attention_from_bridge(
         )
     else:
         raise ValueError(f"Unexpected pixel_values shape: {pixel_values.shape}")
-    if REPLACED and bridge.use_grid_thw_list:
+    if REPLACED:
         grid_thw_list = policy_td.image_grid_thw_list
         grid_thw_list = sum(grid_thw_list, [])
         image_embeds, deepstack_image_embeds = bridge.causal_model.model.visual(

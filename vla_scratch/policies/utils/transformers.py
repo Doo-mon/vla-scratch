@@ -1,19 +1,7 @@
-from __future__ import annotations
-
 from typing import Tuple
 
 import jaxtyping as at
 import torch
-
-
-def sample_noise(shape, device, dtype):
-    return torch.normal(
-        mean=0.0,
-        std=1.0,
-        size=shape,
-        dtype=dtype,
-        device=device,
-    )
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:

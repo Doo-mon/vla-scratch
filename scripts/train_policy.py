@@ -69,7 +69,7 @@ class TrainConfig:
         default_factory=lambda: [
             "_self_",
             {"policy": "pi-qwen"},
-            {"data": "libero-ipec"},
+            {"data": "libero-spatial"},
             {"train_data": "none"},
             {"eval_data": "none"},
         ]

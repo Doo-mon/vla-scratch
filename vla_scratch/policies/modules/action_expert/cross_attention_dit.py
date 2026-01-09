@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Tuple, Callable, Optional, Dict
 import einops
 
@@ -6,15 +6,30 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.nn import RMSNorm
+from torch.nn.modules.lazy import LazyModuleMixin
+
+import jaxtyping as at
 
 from transformers.activations import ACT2FN
-
-from vla_scratch.policies.utils.data_types import *
 
 from vla_scratch.policies.utils.transformers import apply_rotary_pos_emb
 from vla_scratch.policies.utils.training import apply_checkpoint_when_training
 
-from torch.nn.modules.lazy import LazyModuleMixin
+HiddenState = at.Float[torch.Tensor, "*batch_size n_q hidden_dim"]
+PositionIds = at.Int64[torch.Tensor, "*batch_size n_q"]
+PositionEmbs = Tuple[
+    at.Float[torch.Tensor, "*batch_size n_q head_dim"], at.Float[torch.Tensor, "*batch_size n_q head_dim"]
+]
+
+
+AttentionMask = at.Bool[torch.Tensor, "*batch_size 1 n_q n_kv"]
+AdarmsCond = at.Float[torch.Tensor, "*batch_size cond_dim"]
+KVCache = Tuple[
+    at.Float[torch.Tensor, "*batch_size depth n_past_kv n_kv_heads head_dim"],
+    at.Float[torch.Tensor, "*batch_size depth n_past_kv n_kv_heads head_dim"],
+]
+
+PrefixPadMask = at.Bool[torch.Tensor, "*batch_size n_past_kv"]
 
 
 class LazyRMSNorm(LazyModuleMixin, torch.nn.Module):
@@ -115,18 +130,15 @@ class DiTConfig:
     head_dim: int
 
     cross_attention_every: int = 2
+    num_hidden_layers: int = 12
+    only_attend_to_final_layer: bool = True
+
     qk_norm: Optional[str] = "layernorm"
     rotary_self_attn: bool = True
-    only_attend_to_final_layer: bool = True
 
     attn_dropout: float = 0.0
     mlp_dropout: float = 0.0
     mlp_activation: str = "silu"
-
-    num_hidden_layers: int = 12
-    layers_for_dispersive_loss: list[int] = field(default_factory=lambda: [6])
-    # layers_for_dispersive_loss = [4, 6, 8]
-    dispersive_loss_tau: float = 1.0
 
     rms_norm_eps: float = 1e-6
     attention_dropout: float = 0.0
@@ -381,7 +393,6 @@ class DiTModel(nn.Module):
         cos, sin = self.rotary_emb(position_ids, dtype=inputs_embeds.dtype)
 
         hidden_states = inputs_embeds
-        hidden_states_for_dispersive_loss = []
         cross_every = max(1, self.config.cross_attention_every)
         for i, layer in enumerate(self.blocks):
             is_cross = (i % cross_every) == (cross_every - 1)
@@ -399,8 +410,6 @@ class DiTModel(nn.Module):
                     (cos, sin) if self.config.rotary_self_attn else None
                 )
             torch.cuda.nvtx.range_push(f"layer_{i}")
-            if i in self.config.layers_for_dispersive_loss:
-                hidden_states_for_dispersive_loss.append(hidden_states)
             hidden_states, (k, v) = apply_checkpoint_when_training(
                 self,
                 layer,
@@ -415,26 +424,4 @@ class DiTModel(nn.Module):
             torch.cuda.nvtx.range_pop()
 
         hidden_states = self.norm(hidden_states)
-
-        dispersive_loss = 0.0
-        if hidden_states_for_dispersive_loss:
-            dispersive_loss = self._compute_dispersive_loss(
-                hidden_states_for_dispersive_loss
-            )
-        log_dict = {"loss/disp_loss": dispersive_loss.detach()}
-        return dispersive_loss, hidden_states, log_dict
-
-    def _compute_dispersive_loss(
-        self, hidden_states_list: List[torch.Tensor]
-    ) -> torch.Tensor:
-        """InfoNCE-based dispersive loss using squared L2 distance."""
-        tau = self.config.dispersive_loss_tau
-        hidden_states = torch.stack(hidden_states_list, dim=1)
-        z = einops.rearrange(hidden_states, "b l s d -> (b l) (s d)")
-        z_cast = z.type(torch.float32)
-        diff = nn.functional.pdist(z_cast).pow(2) / z.shape[1]
-        diff = diff.type(z.dtype)
-        diff = torch.concat(
-            (diff, diff, torch.zeros(z.shape[0], device=z.device, dtype=z.dtype))
-        )
-        return torch.log(torch.exp(-diff / tau).mean())
+        return 0.0, hidden_states, {}

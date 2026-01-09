@@ -11,22 +11,25 @@ from vla_scratch.policies.utils.training import (
     apply_checkpoint_when_training,
     fully_shard_layers,
 )
-from vla_scratch.policies.modules.vlm_bridge.base import VLMBridge, TARGET_IGNORE_ID
+from vla_scratch.policies.modules.vlm_bridge.base import VLMBridge, VLMOutputs, TARGET_IGNORE_ID
 from vla_scratch.policies.modules.vlm_bridge.qwen.processor import QwenPolicyInput
 from vla_scratch.policies.modules.vlm_bridge.qwen.utils import (
     is_qwen3vl_forward_replaced,
     replace_qwen3vl_forward,
 )
 from vla_scratch.policies.utils.transformers import make_att_2d_masks
-from vla_scratch.policies.modules.vlm_bridge.data_types import VLMOutputs
 
 if TYPE_CHECKING:
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel, Qwen3VLVisionModel, Qwen3VLForConditionalGeneration
     from vla_scratch.transforms.data_types import Observation
 
+# for performance ablation
+QWEN3_VL_USE_GRID_THW_LIST = True
+QWEN3_VL_RECOMPUTE_POS_IDS = False
+QWEN3_VL_MASKED_ADD_STACK = True
 
 class Qwen3VLBridge(VLMBridge):
-    def __init__(self, *, model_id: str, vlm_type: str, use_grid_thw_list: bool = True, recompute_pos_ids: bool = False, masked_add_stack: bool = True):
+    def __init__(self, *, model_id: str, vlm_type: str):
         super().__init__()
         tfm = importlib.import_module("transformers")
         try:
@@ -50,10 +53,6 @@ class Qwen3VLBridge(VLMBridge):
         replace_qwen3vl_forward()
         visual: "Qwen3VLVisionModel" = self.causal_model.model.visual
         visual.prepared_freq_table = visual.rotary_pos_emb(128)
-
-        self.use_grid_thw_list = use_grid_thw_list
-        self.recompute_pos_ids = recompute_pos_ids
-        self.masked_add_stack = masked_add_stack
 
     def apply_fsdp(self, mp_policy, mesh):
         fully_shard_layers(self.causal_model.model.visual.blocks, mesh, mp_policy)
@@ -95,7 +94,7 @@ class Qwen3VLBridge(VLMBridge):
         pixel_values = einops.rearrange(
             policy_td.pixel_values, "b grid patch -> (b grid) patch"
         )
-        if REPLACED and self.use_grid_thw_list:
+        if REPLACED and QWEN3_VL_USE_GRID_THW_LIST:
             grid_thw_list = policy_td.image_grid_thw_list
             grid_thw_list = sum(grid_thw_list, [])
             assert all(
@@ -124,7 +123,7 @@ class Qwen3VLBridge(VLMBridge):
         position_ids = einops.rearrange(
             policy_td.position_ids, "b plane 1 s -> plane b s"
         )
-        if self.recompute_pos_ids:
+        if QWEN3_VL_RECOMPUTE_POS_IDS:
             position_ids, _ = self.causal_model.model.get_rope_index(
                 input_ids=policy_td.input_ids,
                 image_grid_thw=policy_td.image_grid_thw.flatten(0, 1),
@@ -216,7 +215,7 @@ class Qwen3VLBridge(VLMBridge):
                 len(deepstack_image_embeds)
             ):
                 torch.cuda.nvtx.range_push("deepstack_inject")
-                if self.masked_add_stack:
+                if QWEN3_VL_MASKED_ADD_STACK:
                     delta = torch.zeros_like(hidden_states)
                     delta.masked_scatter_(image_mask.unsqueeze(-1), deepstack_image_embeds[layer_idx])
                     hidden_states.add_(delta)

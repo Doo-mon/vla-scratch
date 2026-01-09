@@ -1,11 +1,11 @@
 import importlib
-from typing import Tuple, TYPE_CHECKING
+from typing import Optional, Tuple, TYPE_CHECKING
 
 import torch
-import torch.nn.functional as F
 from tensordict import TensorClass
 
 from vla_scratch.transforms.base import TransformFn
+from vla_scratch.policies.modules.vlm_bridge.base import TARGET_IGNORE_ID
 
 if TYPE_CHECKING:
     from vla_scratch.transforms.data_types import DataSample
@@ -16,6 +16,8 @@ class PaligemmaPolicyInput(TensorClass):
     pixel_values: torch.FloatTensor
     input_ids: torch.LongTensor
     attention_mask: torch.BoolTensor
+    target_ids: torch.LongTensor
+    obs_register_att_mask: torch.BoolTensor
 
 
 class PaligemmaProcessor(TransformFn):
@@ -39,28 +41,88 @@ class PaligemmaProcessor(TransformFn):
         self.truncation = truncation
         self.padding = padding
         self.max_length = max_length
-
+        self.prompt_sep_text = "<<<PROMPT_SEP>>>"
+        self.prompt_sep_ids = self.tokenizer.encode(
+            self.prompt_sep_text, add_special_tokens=False
+        )
     def compute(self, sample: "DataSample") -> "DataSample":
-        # TODO: change to apply chat template
         images = sample.observation.images.type(torch.uint8)
-        pixel_values = self.processor.image_processor(images, return_tensors="pt")["pixel_values"]
-
-        task_prompt: str = sample.observation.task
-        # prompt: str = f"<bos>Task: {task_prompt}; \n Action:"
-        prompt: str = f"<bos>{task_prompt}\n"
-        # prompt: str = f"{task_prompt}"
-        encoded = self.tokenizer(
-            prompt,
+        images_list = [[img for img in images]]
+        prompt = f"{sample.observation.task}{self.prompt_sep_text}{sample.observation.generation_prompt}"
+        num_images = images.shape[0]
+        prompt = "".join(["<image>"] * num_images + [prompt])
+        suffix = sample.observation.generation_answer
+        encoded = self.processor(
+            text=prompt,
+            images=images_list,
+            suffix=suffix,
             max_length=self.max_length,
             truncation=self.truncation,
             padding=self.padding,
             return_tensors="pt",
         )
+        input_ids = encoded["input_ids"]
+        attention_mask = encoded["attention_mask"]
+        target_ids = encoded.get("labels")
+        if target_ids is None:
+            target_ids = input_ids.clone()
+            target_ids.fill_(TARGET_IGNORE_ID)
+        else:
+            eos_token_id = self.tokenizer.eos_token_id
+            if eos_token_id is not None:
+                target_ids[input_ids == eos_token_id] = TARGET_IGNORE_ID
+
+        # print("Decoded input ids:")
+        # print(self.tokenizer.decode(input_ids[0], skip_special_tokens=False))
+
+        # print("Decoded input ids after replacing image token id with 0:")
+        # input_ids[input_ids == self.processor.image_token_id] = 0
+        # print(self.tokenizer.decode(input_ids[0], skip_special_tokens=False))
+
+        # print("target ids:")
+        # target_ids[target_ids == TARGET_IGNORE_ID] = 0
+        # print(self.tokenizer.decode(target_ids[0], skip_special_tokens=False))
+        # breakpoint()
+
+        obs_register_att_mask = self._build_obs_register_att_mask(
+            input_ids, attention_mask
+        )
         policy_td = PaligemmaPolicyInput(
-            # images=images,
-            pixel_values=pixel_values,
-            input_ids=encoded["input_ids"].squeeze(0).long(),
-            attention_mask=encoded["attention_mask"].squeeze(0).bool(),
+            pixel_values=encoded["pixel_values"],
+            input_ids=input_ids.squeeze(0).long(),
+            attention_mask=attention_mask.squeeze(0).bool(),
+            target_ids=target_ids.squeeze(0).long(),
+            obs_register_att_mask=obs_register_att_mask.squeeze(0).bool(),
         )
         sample.observation.policy_input = policy_td
         return sample
+
+    def _build_obs_register_att_mask(
+        self, input_ids: torch.LongTensor, attention_mask: torch.Tensor
+    ) -> torch.BoolTensor:
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+        if attention_mask.ndim == 1:
+            attention_mask = attention_mask.unsqueeze(0)
+
+        bsz, seqlen = input_ids.shape
+        mask = torch.zeros((bsz, seqlen), dtype=torch.bool, device=input_ids.device)
+        for b in range(bsz):
+            sep_start = self._find_subsequence(
+                input_ids[b].tolist(), self.prompt_sep_ids
+            )
+            if sep_start is None:
+                mask[b] = attention_mask[b].bool()
+            else:
+                mask[b, :sep_start] = attention_mask[b, :sep_start].bool()
+        return mask
+
+    @staticmethod
+    def _find_subsequence(sequence: list[int], subsequence: list[int]) -> Optional[int]:
+        if not subsequence:
+            return None
+        max_start = len(sequence) - len(subsequence)
+        for i in range(max_start + 1):
+            if sequence[i : i + len(subsequence)] == subsequence:
+                return i
+        return None

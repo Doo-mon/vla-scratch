@@ -44,33 +44,32 @@ VLA-Scratch is a fully modular, high-performance VLA stack built around Hydra co
 
 ## 🚀 Quickstart
 
-```bash
-# Setup virtual environment and install dependencies:
-uv sync
-source .venv/bin/activate
+Setup your environment with `uv sync`. 
 
-# For torch compile and lerobot decode video
-apt update
-apt install -y python3.10-dev ffmpeg 
-```
+Verify your installation with the following command:
 
-### Training
 ```bash
-torchrun --standalone --nnodes=1 --nproc_per_node=8 \
-    train_policy.py \
+# Training
+uv run torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+    scripts/train_policy.py \
     policy=pi-qwen \
-    policy.state_history=1 \
-    policy.action_horizon=10 \
-    policy.use_state=False \
-    policy.transforms.0.max_length=500 \
     data=libero-spatial \
-    batch_size=32 \
-    eval_data=libero-spatial \
     lr.base=5e-5 \
     +lr.vlm_bridge=1e-5 \
     +lr.action_expert=5e-5 \
     wandb.mode=online
+
+# Evaluation
+uv run \
+    policy=pi-qwen \
+    policy.state_history=1 \
+    policy.action_horizon=30 \
+    policy.transforms.0.max_length=500 \
+    data=libero-spatial \
+    data.video_backend=pyav \
+    batch_size=16 \
+    checkpoint_path=hf:elijahgalahad/libero_policy
 ```
 
-### Evaluation
-See [examples](examples/README.md) for details about evaluation in LIBERO and other simulation environments.
+
+See [instructions](INSTRUCTIONS.md) for more training and evaluation commands.

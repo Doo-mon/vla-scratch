@@ -4,8 +4,8 @@
 
 | Path            | Description                                                                 |
 |-----------------|-----------------------------------------------------------------------------|
-| `bbox_cotrain/` | BBox co-training rollouts using BlindVLA + ManiSkill with a ZMQ policy RPC. |
-| `libero/`       | LIBERO policy rollouts with windowed rendering and action chunking.         |
+| [`bbox_cotrain/`](bbox_cotrain/) | BBox co-training rollouts using BlindVLA + ManiSkill with a ZMQ policy RPC. |
+| [`libero/`](libero/)       | LIBERO policy rollouts with windowed rendering and action chunking.         |
 
 ## Workflow
 
