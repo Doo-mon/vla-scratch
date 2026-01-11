@@ -319,9 +319,6 @@ def main(cfg: DictConfig) -> None:
 
         model.train()
         for i in pbar:
-            if i == 36:
-                torch.cuda.cudart().cudaProfilerStart()
-
             torch.cuda.nvtx.range_push("Zero Grad")
             model.unshard()
             optimizer.zero_grad(set_to_none=True)
@@ -442,10 +439,6 @@ def main(cfg: DictConfig) -> None:
                 if global_rank == 0:
                     run.log(log_dict)
                 dist.barrier()
-            if i == 48:
-                torch.cuda.cudart().cudaProfilerStop()
-                break
-        break
 
         if (epoch + 1) % train_cfg.save_interval == 0:
             save_checkpoint(model, optimizer, global_rank, f"checkpoint_{epoch+1}")
