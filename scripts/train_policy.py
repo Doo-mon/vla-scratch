@@ -100,7 +100,7 @@ class TrainConfig:
     clip_grad_norm: float = 1.0
 
     # logging and evaluation
-    exp_name: str = "pi-training"
+    exp_name: str = "vla-scratch-training"
     log_interval: int = 32
     eval_interval: int = 512
     epochs: int = 20
