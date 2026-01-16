@@ -40,7 +40,7 @@ uv run scripts/serve_policy.py \
 ```
 
 
-See [Instructions](INSTRUCTIONS.md) for more training commands. See [examples](examples/) for detailed benchmark simulation evaluation instructions.
+See [scripts/README.md](scripts/README.md) for more training commands. See [examples](examples/) for detailed benchmark simulation evaluation instructions.
 
 ## ✨ Key-Features
 
