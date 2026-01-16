@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 import logging
-import os
 import socket
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Sequence, Tuple, cast, TYPE_CHECKING
+from typing import Any, Dict, Optional, Sequence, cast, TYPE_CHECKING
+from setproctitle import setproctitle
 
-import numpy as np
 import art
 import torch
 
@@ -43,7 +42,11 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ServeConfig:
     defaults: list[Any] = field(
-        default_factory=lambda: ["_self_", {"policy": "pi-qwen"}, {"data": "libero-spatial"}]
+        default_factory=lambda: [
+            "_self_",
+            {"policy": "pi-qwen"},
+            {"data": "libero-spatial"},
+        ]
     )
 
     # server
@@ -62,7 +65,9 @@ cs = ConfigStore.instance()
 cs.store(name="serve", node=ServeConfig())
 
 
-def _initialize_policy_dims(data_cfg: DataConfig, policy_cfg: PolicyConfig) -> None:
+def _initialize_policy_dims(
+    data_cfg: DataConfig, policy_cfg: PolicyConfig
+) -> None:
     data_cfg.action_horizon = policy_cfg.action_horizon
     data_cfg.state_history = policy_cfg.state_history
 
@@ -71,7 +76,9 @@ def _initialize_policy_dims(data_cfg: DataConfig, policy_cfg: PolicyConfig) -> N
         policy_cfg,
     )
     if len(dataset) == 0:
-        raise ValueError("Dataset is empty; unable to infer action/state dimensions.")
+        raise ValueError(
+            "Dataset is empty; unable to infer action/state dimensions."
+        )
 
     data_sample: "DataSample" = dataset[0][0]
     action_tensor = (
@@ -80,9 +87,13 @@ def _initialize_policy_dims(data_cfg: DataConfig, policy_cfg: PolicyConfig) -> N
         else None
     )
     if action_tensor is None:
-        raise ValueError("Dataset sample has no actions; unable to infer action_dim.")
+        raise ValueError(
+            "Dataset sample has no actions; unable to infer action_dim."
+        )
     if data_sample.observation.state is None:
-        raise ValueError("Dataset sample has no state; unable to infer state_dim.")
+        raise ValueError(
+            "Dataset sample has no state; unable to infer state_dim."
+        )
 
     action_dim = int(action_tensor.shape[-1])
     state_dim = int(data_sample.observation.state.shape[-1])
@@ -148,6 +159,7 @@ def main(cfg: DictConfig) -> None:
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
     art.tprint("VLA-SCRATCH", font="big")
+    setproctitle("vla-serve")
     if (checkpoint_path := cfg.get("checkpoint_path")) is not None:
         cfg.checkpoint_path = find_latest_checkpoint(checkpoint_path)
     if cfg.get("merge_policy_cfg", False):
@@ -181,13 +193,17 @@ def main(cfg: DictConfig) -> None:
         if missing:
             logger.warning("Missing keys when loading checkpoint: %s", missing)
         if unexpected:
-            logger.warning("Unexpected keys when loading checkpoint: %s", unexpected)
+            logger.warning(
+                "Unexpected keys when loading checkpoint: %s", unexpected
+            )
 
     model.eval()
 
     # Build transforms
     input_transforms = build_input_transforms(serve_cfg.data, serve_cfg.policy)
-    output_transforms = build_output_transforms(serve_cfg.data, serve_cfg.policy)
+    output_transforms = build_output_transforms(
+        serve_cfg.data, serve_cfg.policy
+    )
     input_transforms = [ToTorch()] + input_transforms
     output_transforms = output_transforms + [ToNumpy()]
 

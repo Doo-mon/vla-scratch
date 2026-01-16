@@ -4,22 +4,21 @@
 """
 Evaluate a policy on a dataset using Hydra configs (mirrors train_policy grammar).
 
-- Expects data and policy groups (e.g., data=moz, policy=pi)
+- Expects data and policy groups (e.g., data=libero-spatial, policy=pi-qwen)
 - Optionally loads a checkpoint and computes MSE over a subset
 """
 
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, cast, TYPE_CHECKING
+from typing import Any, Optional, cast, TYPE_CHECKING
 import os
-from tqdm import tqdm
 import art
+from setproctitle import setproctitle
 
 import hydra
 from hydra.core.config_store import ConfigStore
 from omegaconf import DictConfig, OmegaConf, MISSING
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
 from vla_scratch.datasets.config import DataConfig
@@ -42,7 +41,11 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 @dataclass
 class EvalConfig:
     defaults: list[Any] = field(
-        default_factory=lambda: ["_self_", {"policy": "pi-qwen"}, {"data": "libero-spatial"}]
+        default_factory=lambda: [
+            "_self_",
+            {"policy": "pi-qwen"},
+            {"data": "libero-spatial"},
+        ]
     )
     # Hydra configs
     data: DataConfig = MISSING
@@ -67,6 +70,7 @@ def main(cfg: DictConfig) -> None:
     OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
     art.tprint("VLA-SCRATCH", font="big")
+    setproctitle("vla-eval")
     if (checkpoint_path := cfg.get("checkpoint_path")) is not None:
         cfg.checkpoint_path = find_latest_checkpoint(checkpoint_path)
     if cfg.get("merge_policy_cfg", False):
@@ -83,7 +87,6 @@ def main(cfg: DictConfig) -> None:
     data_cfg.action_horizon = policy_cfg.action_horizon
     data_cfg.state_history = policy_cfg.state_history
 
-    # Disable image augmentation for eval if SpiritImages present
     for i, spec in enumerate(list(data_cfg.input_transforms or [])):
         if isinstance(spec, dict) and "enable_aug" in spec:
             spec.update({"enable_aug": False})
@@ -112,7 +115,9 @@ def main(cfg: DictConfig) -> None:
         if missing:
             print(f"Warning: Missing keys when loading checkpoint: {missing}")
         if unexpected:
-            print(f"Warning: Unexpected keys when loading checkpoint: {unexpected}")
+            print(
+                f"Warning: Unexpected keys when loading checkpoint: {unexpected}"
+            )
     model.eval()
 
     # Dataloader — subset for speed
@@ -131,7 +136,11 @@ def main(cfg: DictConfig) -> None:
 
     # Evaluate MSE
     mse = eval_sample_mse(
-        model, loader, device, num_sample_steps=int(eval_cfg.num_steps), local_rank=0
+        model,
+        loader,
+        device,
+        num_sample_steps=int(eval_cfg.num_steps),
+        local_rank=0,
     )
     mse = mse["sample_mse"]
     print(

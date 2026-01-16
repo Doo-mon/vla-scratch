@@ -34,7 +34,9 @@ class SmolVLMProcessor(TransformFn):
     ) -> None:
         processors = importlib.import_module("transformers")
         processor_cls = getattr(processors, processor_class)
-        self.processor: "SmolVLMProcessor" = processor_cls.from_pretrained(model_id)
+        self.processor: "SmolVLMProcessor" = processor_cls.from_pretrained(
+            model_id
+        )
         self.max_length = max_length
         self.padding = padding
         if image_size_longest_edge is not None:
@@ -49,7 +51,9 @@ class SmolVLMProcessor(TransformFn):
         tokenizer = self.processor.tokenizer
         tokenizer.padding_side = "left"
         self.prompt_sep_text = "<<<PROMPT_SEP>>>"
-        self.prompt_sep_ids = tokenizer.encode(self.prompt_sep_text, add_special_tokens=False)
+        self.prompt_sep_ids = tokenizer.encode(
+            self.prompt_sep_text, add_special_tokens=False
+        )
         self.assistant_header_ids = tokenizer.encode(
             "\nAssistant:", add_special_tokens=False
         )
@@ -60,14 +64,18 @@ class SmolVLMProcessor(TransformFn):
     def compute(self, sample: "DataSample") -> "DataSample":
         images = sample.observation.images
 
-        user_content: List[Dict] = [{"type": "image", "image": img} for img in images]
+        user_content: List[Dict] = [
+            {"type": "image", "image": img} for img in images
+        ]
         user_content.append({"type": "text", "text": sample.observation.task})
         user_content.append({"type": "text", "text": self.prompt_sep_text})
         user_content.append(
             {"type": "text", "text": sample.observation.generation_prompt}
         )
 
-        gpt_content = [{"type": "text", "text": sample.observation.generation_answer}]
+        gpt_content = [
+            {"type": "text", "text": sample.observation.generation_answer}
+        ]
         messages = [
             {"role": "user", "content": user_content},
             {"role": "assistant", "content": gpt_content},
@@ -112,7 +120,9 @@ class SmolVLMProcessor(TransformFn):
         attention_mask = encoded["attention_mask"]
 
         bsz, seqlen = input_ids.shape
-        mask = torch.zeros((bsz, seqlen), dtype=torch.bool, device=input_ids.device)
+        mask = torch.zeros(
+            (bsz, seqlen), dtype=torch.bool, device=input_ids.device
+        )
         for b in range(bsz):
             sep_start = self._find_subsequence(
                 input_ids[b].tolist(), self.prompt_sep_ids
@@ -125,7 +135,9 @@ class SmolVLMProcessor(TransformFn):
         return mask
 
     @staticmethod
-    def _find_subsequence(sequence: list[int], subsequence: list[int]) -> Optional[int]:
+    def _find_subsequence(
+        sequence: list[int], subsequence: list[int]
+    ) -> Optional[int]:
         if isinstance(sequence, torch.Tensor):
             sequence = sequence.tolist()
         if not subsequence:
@@ -149,7 +161,9 @@ class SmolVLMProcessor(TransformFn):
             input_ids = input_ids.unsqueeze(0)
 
         bsz, seqlen = input_ids.shape
-        mask = torch.zeros((bsz, seqlen), dtype=torch.bool, device=input_ids.device)
+        mask = torch.zeros(
+            (bsz, seqlen), dtype=torch.bool, device=input_ids.device
+        )
         for b in range(bsz):
             ids_list = input_ids[b].tolist()
             header_start = SmolVLMProcessor._find_subsequence(

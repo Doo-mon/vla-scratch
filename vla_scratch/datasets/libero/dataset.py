@@ -3,9 +3,18 @@ from typing import TYPE_CHECKING
 
 import torch
 import numpy as np
-from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata, LeRobotDataset
+from lerobot.datasets.lerobot_dataset import (
+    LeRobotDatasetMetadata,
+    LeRobotDataset,
+)
 
-from vla_scratch.transforms.data_keys import PROCESSED_STATE_KEY, PROCESSED_ACTION_KEY, PROCESSED_IMAGE_KEY, PROCESSED_IMAGE_MASK_KEY, TASK_KEY
+from vla_scratch.transforms.data_keys import (
+    PROCESSED_STATE_KEY,
+    PROCESSED_ACTION_KEY,
+    PROCESSED_IMAGE_KEY,
+    PROCESSED_IMAGE_MASK_KEY,
+    TASK_KEY,
+)
 
 if TYPE_CHECKING:
     from vla_scratch.datasets.libero.config import LiberoConfig
@@ -33,12 +42,14 @@ class LIBERODataset(torch.utils.data.Dataset):
         delta_timestamps = {}
         for key in self.cmd_keys:
             delta_timestamps[key] = (
-                np.linspace(0, action_horizon - 1, action_horizon, dtype=int) / fps
+                np.linspace(0, action_horizon - 1, action_horizon, dtype=int)
+                / fps
             ).tolist()
 
         for key in self.state_keys:
             delta_timestamps[key] = (
-                np.linspace(-state_history, 0, state_history + 1, dtype=int) / fps
+                np.linspace(-state_history, 0, state_history + 1, dtype=int)
+                / fps
             ).tolist()
 
         self.dataset = LeRobotDataset(

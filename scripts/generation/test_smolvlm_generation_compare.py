@@ -66,7 +66,14 @@ def autoregressive_decode(
         for _ in range(max_new_tokens):
             generated_ids.append(next_token)
             attention_mask = torch.cat(
-                [attention_mask, torch.ones((attention_mask.shape[0], 1), device=device, dtype=attention_mask.dtype)],
+                [
+                    attention_mask,
+                    torch.ones(
+                        (attention_mask.shape[0], 1),
+                        device=device,
+                        dtype=attention_mask.dtype,
+                    ),
+                ],
                 dim=1,
             )
 
@@ -83,7 +90,9 @@ def autoregressive_decode(
             past_key_values = decode_outputs.past_key_values
             cache_position = cache_position + 1
 
-            next_token = decode_outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            next_token = decode_outputs.logits[:, -1, :].argmax(
+                dim=-1, keepdim=True
+            )
             if next_token.item() == eos_token_id:
                 break
 
@@ -113,12 +122,17 @@ def main() -> None:
         prefix_pad_masks = vlm_outputs.prefix_pad_masks
         key_states = vlm_outputs.key_states
         value_states = vlm_outputs.value_states
-        logits = policy.vlm_bridge.causal_model.lm_head(hidden_states_bridge[:, -1:, :])
+        logits = policy.vlm_bridge.causal_model.lm_head(
+            hidden_states_bridge[:, -1:, :]
+        )
         next_tok_bridge = logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
     cache_pos_bridge = torch.tensor([prefix_pad_masks.shape[1]], device=device)
     attn_mask_bridge = prefix_pad_masks
-    kv_cache_list = [(k, v) for k, v in zip(key_states.unbind(dim=1), value_states.unbind(dim=1))]
+    kv_cache_list = [
+        (k, v)
+        for k, v in zip(key_states.unbind(dim=1), value_states.unbind(dim=1))
+    ]
     kv_cache_bridge = DynamicCache.from_legacy_cache(tuple(kv_cache_list))
 
     # Baseline path using HF forward (original implementations)
@@ -135,7 +149,9 @@ def main() -> None:
         hf_outputs = policy.vlm_bridge.causal_model(**hf_inputs)
 
     kv_prefill = hf_outputs.past_key_values
-    cache_pos_prefill = torch.tensor([hf_inputs["input_ids"].shape[1]], device=device)
+    cache_pos_prefill = torch.tensor(
+        [hf_inputs["input_ids"].shape[1]], device=device
+    )
     attn_mask_prefill = hf_inputs["attention_mask"]
     next_tok_prefill = hf_outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
@@ -145,14 +161,26 @@ def main() -> None:
     for idx, ((bk, bv), (hk, hv)) in enumerate(zip(bridge_legacy, hf_legacy)):
         k_close = torch.allclose(bk, hk, atol=1e-3, rtol=1e-3)
         v_close = torch.allclose(bv, hv, atol=1e-3, rtol=1e-3)
-        print(f"Layer {idx}: keys match={k_close}, values match={v_close}, shape={bk.shape}")
+        print(
+            f"Layer {idx}: keys match={k_close}, values match={v_close}, shape={bk.shape}"
+        )
 
-    print(f"Next token bridge vs prefill: {next_tok_bridge.item()} vs {next_tok_prefill.item()}")
-    print(f"Attention mask equal: {torch.equal(attn_mask_bridge, attn_mask_prefill)}")
-    print(f"Cache position bridge vs prefill: {cache_pos_bridge.item()} vs {cache_pos_prefill.item()}")
+    print(
+        f"Next token bridge vs prefill: {next_tok_bridge.item()} vs {next_tok_prefill.item()}"
+    )
+    print(
+        f"Attention mask equal: {torch.equal(attn_mask_bridge, attn_mask_prefill)}"
+    )
+    print(
+        f"Cache position bridge vs prefill: {cache_pos_bridge.item()} vs {cache_pos_prefill.item()}"
+    )
 
-    decoded_bridge = decode_tokens(policy.vlm_bridge.processor, torch.cat([next_tok_bridge], dim=-1))
-    decoded_prefill = decode_tokens(policy.vlm_bridge.processor, torch.cat([next_tok_prefill], dim=-1))
+    decoded_bridge = decode_tokens(
+        policy.vlm_bridge.processor, torch.cat([next_tok_bridge], dim=-1)
+    )
+    decoded_prefill = decode_tokens(
+        policy.vlm_bridge.processor, torch.cat([next_tok_prefill], dim=-1)
+    )
     print(f"Decoded bridge token: {decoded_bridge}")
     print(f"Decoded prefill token: {decoded_prefill}")
 

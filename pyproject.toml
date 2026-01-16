@@ -19,6 +19,7 @@ dependencies = [
     "tensordict",
     "transformers==4.57.1",
     "lerobot @ git+https://github.com/huggingface/lerobot@v0.4.2",
+    "num2words", # for smolvlm
     "jsonlines",
     "pillow",
     "torchvision==0.22.0",
@@ -27,19 +28,22 @@ dependencies = [
     "wandb",
     "setproctitle",
     "setuptools",
+
     # serve policy
     "pyzmq",
     "msgpack",
-    "matplotlib",
-    "mujoco",
     "art",
+    "emoji>=2.15.0",
+    
     # debug
     "pdbpp",
-    # not used
+
+    # NOT USED
+    # "matplotlib",
+    # "mujoco",
     # "h5py",
     # "accelerate",
     # "viser",
-    "emoji>=2.15.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -51,6 +55,10 @@ include = [
 namespaces = true
 
 [project.optional-dependencies]
-smolvlm = [
-    "num2words",
+dev = [
+    "black>=24.8.0",
 ]
+
+[tool.black]
+line-length = 80
+target-version = ["py310"]

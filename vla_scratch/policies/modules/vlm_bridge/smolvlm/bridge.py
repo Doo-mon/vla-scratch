@@ -6,7 +6,9 @@ from copy import copy
 
 import torch
 
-from vla_scratch.policies.modules.vlm_bridge.smolvlm.utils import replace_context
+from vla_scratch.policies.modules.vlm_bridge.smolvlm.utils import (
+    replace_context,
+)
 from vla_scratch.policies.utils.training import (
     apply_checkpoint_when_training,
     fully_shard_layers,
@@ -16,7 +18,9 @@ from vla_scratch.policies.modules.vlm_bridge.base import (
     VLMOutputs,
     TARGET_IGNORE_ID,
 )
-from vla_scratch.policies.modules.vlm_bridge.smolvlm.processor import SmolVLMPolicyInput
+from vla_scratch.policies.modules.vlm_bridge.smolvlm.processor import (
+    SmolVLMPolicyInput,
+)
 from vla_scratch.policies.utils.transformers import make_att_2d_masks
 
 if TYPE_CHECKING:
@@ -33,13 +37,17 @@ class SmolVLMBridge(VLMBridge):
         try:
             vlm_cls = getattr(tfm, vlm_type)
         except AttributeError as e:
-            raise ImportError(f"transformers has no class named '{vlm_type}'.") from e
+            raise ImportError(
+                f"transformers has no class named '{vlm_type}'."
+            ) from e
 
-        self.causal_model: "SmolVLMForConditionalGeneration" = vlm_cls.from_pretrained(
-            model_id,
-            attn_implementation="sdpa",
-            trust_remote_code=True,
-            device_map=torch.cuda.current_device(),
+        self.causal_model: "SmolVLMForConditionalGeneration" = (
+            vlm_cls.from_pretrained(
+                model_id,
+                attn_implementation="sdpa",
+                trust_remote_code=True,
+                device_map=torch.cuda.current_device(),
+            )
         )
 
         SmolVLMProcessor = getattr(tfm, "SmolVLMProcessor")
@@ -51,12 +59,21 @@ class SmolVLMBridge(VLMBridge):
         fully_shard_layers(
             self.causal_model.model.vision_model.encoder.layers, mesh, mp_policy
         )
-        fully_shard_layers(self.causal_model.model.text_model.layers, mesh, mp_policy)
+        fully_shard_layers(
+            self.causal_model.model.text_model.layers, mesh, mp_policy
+        )
 
     def get_text_dims(self) -> Tuple[int, int, int]:
         cfg = self.causal_model.config.text_config
-        head_dim = getattr(cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads)
-        return cfg.num_hidden_layers, head_dim, cfg.num_key_value_heads, cfg.hidden_size
+        head_dim = getattr(
+            cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads
+        )
+        return (
+            cfg.num_hidden_layers,
+            head_dim,
+            cfg.num_key_value_heads,
+            cfg.hidden_size,
+        )
 
     @replace_context()
     def encode(
@@ -71,14 +88,18 @@ class SmolVLMBridge(VLMBridge):
     ) -> Tuple[torch.Tensor, VLMOutputs, Dict]:
         policy_td: "SmolVLMPolicyInput" = observation.policy_input
         if not isinstance(policy_td, SmolVLMPolicyInput):
-            raise TypeError("Observation policy_input must be SmolVLMPolicyInput")
+            raise TypeError(
+                "Observation policy_input must be SmolVLMPolicyInput"
+            )
 
         input_ids = policy_td.input_ids
         input_pad_masks = policy_td.attention_mask
         target_ids = policy_td.target_ids
         pixel_values = policy_td.pixel_values
         if pixel_values.ndim == 6:
-            bsz, num_images, num_frames, channels, height, width = pixel_values.shape
+            bsz, num_images, num_frames, channels, height, width = (
+                pixel_values.shape
+            )
             pixel_values = pixel_values.reshape(
                 bsz, num_images * num_frames, channels, height, width
             )
@@ -90,7 +111,9 @@ class SmolVLMBridge(VLMBridge):
         torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("embed_image")
-        image_hidden_states = self.causal_model.model.get_image_features(pixel_values)
+        image_hidden_states = self.causal_model.model.get_image_features(
+            pixel_values
+        )
         image_hidden_states = image_hidden_states.to(
             inputs_embeds.device, inputs_embeds.dtype
         )
@@ -133,7 +156,9 @@ class SmolVLMBridge(VLMBridge):
 
         attention_mask = prefix_pad_masks
         if extra_embs is not None or extra_attention_mask:
-            prefix_att_2d = make_att_2d_masks(prefix_pad_masks, prefix_att_masks_1d)
+            prefix_att_2d = make_att_2d_masks(
+                prefix_pad_masks, prefix_att_masks_1d
+            )
             if extra_embs is not None and extra_attention_mask:
                 obs_reg_att_mask = policy_td.obs_register_att_mask
                 prefix_len = input_pad_masks.shape[1]
@@ -145,7 +170,9 @@ class SmolVLMBridge(VLMBridge):
             attn_mask = torch.zeros(
                 prefix_att_2d.shape, device=embs.device, dtype=embs.dtype
             )
-            attn_mask.masked_fill_(~prefix_att_2d, torch.finfo(attn_mask.dtype).min)
+            attn_mask.masked_fill_(
+                ~prefix_att_2d, torch.finfo(attn_mask.dtype).min
+            )
             attention_mask = attn_mask[:, None, :, :]
 
         from transformers.cache_utils import DynamicCache
@@ -192,7 +219,10 @@ class SmolVLMBridge(VLMBridge):
         pred_logits = pred_logits.reshape(-1, pred_logits.shape[-1])
         target_ids = target_ids[:, 1:].reshape(-1)
         ce_loss_sum = torch.nn.functional.cross_entropy(
-            pred_logits, target_ids, ignore_index=TARGET_IGNORE_ID, reduction="sum"
+            pred_logits,
+            target_ids,
+            ignore_index=TARGET_IGNORE_ID,
+            reduction="sum",
         )
         num_correct_tokens = (pred_logits.argmax(dim=-1) == target_ids).sum()
         total = (target_ids != TARGET_IGNORE_ID).sum().clamp(min=1)

@@ -45,7 +45,9 @@ def _smolvlm_inputs_merger_fast(
 
     gather_idx = flat_idx.unsqueeze(-1).expand(batch_size, seq_len, hidden_size)
     scatter_values = torch.gather(image_states, 1, gather_idx)
-    merged = torch.where(image_mask.unsqueeze(-1), scatter_values, inputs_embeds)
+    merged = torch.where(
+        image_mask.unsqueeze(-1), scatter_values, inputs_embeds
+    )
 
     torch.cuda.nvtx.range_pop()
     return merged
@@ -80,8 +82,12 @@ def _smolvlm_vision_embeddings_fast(
     )
     fractional_coords_h = h_indices / nb_patches_h * (1 - 1e-6)
     fractional_coords_w = w_indices / nb_patches_w * (1 - 1e-6)
-    bucket_coords_h = torch.bucketize(fractional_coords_h, boundaries, right=True)
-    bucket_coords_w = torch.bucketize(fractional_coords_w, boundaries, right=True)
+    bucket_coords_h = torch.bucketize(
+        fractional_coords_h, boundaries, right=True
+    )
+    bucket_coords_w = torch.bucketize(
+        fractional_coords_w, boundaries, right=True
+    )
 
     pos_ids = (
         bucket_coords_h[:, None] * self.num_patches_per_side + bucket_coords_w
@@ -101,7 +107,9 @@ def _smolvlm_get_image_features_fast(
     """
     batch_size, num_images, num_channels, height, width = pixel_values.shape
     pixel_values = pixel_values.to(dtype=self.dtype)
-    pixel_values = pixel_values.view(batch_size * num_images, *pixel_values.shape[2:])
+    pixel_values = pixel_values.view(
+        batch_size * num_images, *pixel_values.shape[2:]
+    )
 
     if pixel_attention_mask is None:
         pixel_attention_mask = torch.ones(
