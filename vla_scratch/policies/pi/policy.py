@@ -384,8 +384,10 @@ class PiPolicy(BasePolicy):
         self, observation: "Observation", num_steps=10
     ) -> at.Float[torch.Tensor, "*batch_size chunk_size action_dim"]:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+        torch.cuda.nvtx.range_push("VLM Encode Prefix")
         _, vlm_output, log_dict = self.encode_prefix(observation)
         suffix_input = self.construct_suffix_input(vlm_output)
+        torch.cuda.nvtx.range_pop()
 
         bsize = observation.shape[0]
         device = observation.device
@@ -405,6 +407,7 @@ class PiPolicy(BasePolicy):
 
         x_t = noise
         while time_float >= dt_float / 2:
+            torch.cuda.nvtx.range_push("Predict Suffix in Sampling")
             _, v_t, _ = self.predict_suffix(
                 observation.state,
                 suffix_input=suffix_input,
@@ -415,6 +418,7 @@ class PiPolicy(BasePolicy):
             x_t = x_t - dt * v_t
             time -= dt
             time_float -= dt_float
+            torch.cuda.nvtx.range_pop()
         return x_t
 
     def _embed_suffix(

@@ -8,6 +8,7 @@ Evaluate a policy on a dataset using Hydra configs (mirrors train_policy grammar
 - Optionally loads a checkpoint and computes MSE over a subset
 """
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Optional, cast, TYPE_CHECKING
 import os
@@ -59,6 +60,7 @@ class EvalConfig:
     # Runtime
     checkpoint_path: Optional[str] = None
     merge_policy_cfg: bool = False
+    use_bf16: bool = True  # Enable bf16 autocast for inference
 
 
 cs = ConfigStore.instance()
@@ -119,6 +121,8 @@ def main(cfg: DictConfig) -> None:
                 f"Warning: Unexpected keys when loading checkpoint: {unexpected}"
             )
     model.eval()
+    if eval_cfg.use_bf16:
+        model.bfloat16()
 
     # Dataloader — subset for speed
     total = len(dataset)
@@ -135,14 +139,20 @@ def main(cfg: DictConfig) -> None:
     )
 
     # Evaluate MSE
-    mse = eval_sample_mse(
-        model,
-        loader,
-        device,
-        num_sample_steps=int(eval_cfg.num_steps),
-        local_rank=0,
+    autocast_ctx = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if eval_cfg.use_bf16
+        else nullcontext()
     )
-    mse = mse["sample_mse"]
+    with autocast_ctx:
+        mse = eval_sample_mse(
+            model,
+            loader,
+            device,
+            num_sample_steps=int(eval_cfg.num_steps),
+            local_rank=0,
+        )
+        mse = mse["sample_mse"]
     print(
         f"Eval MSE over {num} samples (batch={eval_cfg.batch_size}, steps={eval_cfg.num_steps}): {mse:.6f}"
     )
