@@ -22,11 +22,11 @@ uv run scripts/serve_policy.py \
 
 Pretrained checkpoints: [wandb runs](https://wandb.ai/elijahgalahad/vla-scratch/reports/Libero-Spatial-Checkpoints--VmlldzoxNTY0OTI2Mw)
 
-| Huggingface Id                                                                                            | Gradient Steps | Run Time |
-|-----------------------------------------------------------------------------------------------------------|----------------|----------|
-| [`elijahgalahad/libero-spatial-qwen`](https://huggingface.co/elijahgalahad/libero-spatial-qwen)           | 10k            | 2h 58m   |
-| [`elijahgalahad/libero-spatial-paligemma`](https://huggingface.co/elijahgalahad/libero-spatial-paligemma) | 10k            | 4h 14m   |
-| [`elijahgalahad/libero-spatial-smolvlm`](https://huggingface.co/elijahgalahad/libero-spatial-smolvlm)     | 10k            | 2h 18m   |
+| Huggingface Id                                                                                            | Gradient Steps | Run Time | Success Rate |
+|-----------------------------------------------------------------------------------------------------------|----------------|----------|--------------|
+| [`elijahgalahad/libero-spatial-qwen`](https://huggingface.co/elijahgalahad/libero-spatial-qwen)           | 10k            | 2h 58m   | 94%          |
+| [`elijahgalahad/libero-spatial-paligemma`](https://huggingface.co/elijahgalahad/libero-spatial-paligemma) | 10k            | 4h 14m   | 88%          |
+| [`elijahgalahad/libero-spatial-smolvlm`](https://huggingface.co/elijahgalahad/libero-spatial-smolvlm)     | 10k            | 2h 18m   | 76%          |
 
 Start simulation and policy client:
 ```bash
