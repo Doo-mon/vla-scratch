@@ -52,7 +52,7 @@ See [scripts/README.md](scripts/README.md) for more training commands. See [exam
     ![data model](assets/data_model.png)
 - **Dedicated Tuning for a First-Class Performance Stack** 
     - We rewrite the forward pass of VLMs to [eliminate all host-device syncs](vla_scratch/policies/README.md).
-    - Instead of relying on generic libaries like `accelerate`, `vla-scratch` leverage torch native operations like FSDP2 and gradient checkpointing for dedicated performance tuning.
+    - Instead of relying on generic libraries like `accelerate`, `vla-scratch` leverage torch native operations like FSDP2 and gradient checkpointing for dedicated performance tuning.
     ![performance](assets/performance-result.png)
 - **Rich Feature Set Out-of-the-Box**
     - Multi-source dataset co-training: VQA and robotic datasets [co-training](examples/bbox_cotrain).
@@ -66,11 +66,19 @@ See [scripts/README.md](scripts/README.md) for more training commands. See [exam
 
 ## 🗂️ Codebase Structure
 
-VLA-Scratch is a fully modular, high-performance VLA stack built around TensorClass data models, hierarchical config system, and reusable training helpers.
-
 | Path                                                 | Description                                  |
 |------------------------------------------------------|----------------------------------------------|
 | [`vla_scratch/transforms/`](vla_scratch/transforms/) | Data transforms and TensorClass models       |
 | [`vla_scratch/datasets/`](vla_scratch/datasets/)     | Dataset loaders and transforms               |
 | [`vla_scratch/policies/`](vla_scratch/policies/)     | Policy interfaces, bridges, and action heads |
 | [`scripts/`](scripts/)                               | Training/eval/serving scripts                |
+
+---
+
+## 🧭 Developer Guide
+
+| Use Case               | Where to go                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+|------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Create a new dataset   | 1) Create a new folder, e.g. [`vla_scratch/datasets/<dataset_name>`](vla_scratch/datasets/).<br>2) Add implementation and configs (e.g. `dataset.py`, `config.py`).<br>3) Register the dataset config with Hydra `ConfigStore` in `config.py` under the `data` group.                                                                                                                                                                              |
+| Add a new VLM backbone | 1) Create a new folder under [`vla_scratch/policies/modules/vlm_bridge/`](vla_scratch/policies/modules/vlm_bridge/).<br>2) Implement preprocessing in `processor.py`, define the `policy_input` contract between preprocessing and encoding, and implement the main encoding in `bridge.py`.<br>3) Wire the backbone into [`vla_scratch/policies/pi/policy.py`](vla_scratch/policies/pi/policy.py). |
+| Add a new loss term    | 1) Add the loss inside `compute_loss` in [`vla_scratch/policies/pi/policy.py`](vla_scratch/policies/pi/policy.py)<br>2) Return it in `log_dict` so it is logged to Weights & Biases.                                                                                                                                                                                                                                                                   |
