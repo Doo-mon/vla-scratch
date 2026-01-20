@@ -83,3 +83,35 @@ See [scripts/README.md](scripts/README.md) for more training commands. See [exam
 | Add a new VLM backbone | 1) Create a new folder under [`vla_scratch/policies/modules/vlm_bridge/`](vla_scratch/policies/modules/vlm_bridge/).<br>2) Implement preprocessing in `processor.py`, define the `policy_input` contract between preprocessing and encoding, and implement the main encoding in `bridge.py`.<br>3) Wire the backbone into [`vla_scratch/policies/pi/policy.py`](vla_scratch/policies/pi/policy.py). |
 | Add a new loss term    | 1) Add the loss inside `compute_loss` in [`vla_scratch/policies/pi/policy.py`](vla_scratch/policies/pi/policy.py)<br>2) Return it in `log_dict` so it is logged to Weights & Biases.                                                                                                                                                                                                                |
 | Format code            | Run `uvx ruff format`.                                                                                                                                                                                                                                                                                                                                                                              |
+
+
+## 🛠️ Troubleshooting (To be Continued)
+
+<details>
+<summary><strong>RTX 5090 Compatibility</strong></summary>
+
+> **Issue**  
+> PyTorch stable has not yet fully supported **CUDA 12.8** for **RTX 5090**  
+> (Blackwell-generation GPU, compute capability **sm_120**).  
+> This may lead to **kernel launch failures** or **CUDA unavailable** errors.
+
+> **Solution**  
+> Use [PyTorch-Nightly](https://forums.developer.nvidia.com/t/software-migration-guide-for-nvidia-blackwell-rtx-gpus-a-guide-to-cuda-12-8-pytorch-tensorrt-and-llama-cpp/321330) instead of stable PyTorch.  
+
+Add the following to your `<pyproject.toml>`:
+
+    ```
+    [[tool.uv.index]]
+    name = "pytorch-nightly-cu128"
+    url = "https://download.pytorch.org/whl/nightly/cu128"
+    default = true
+
+    [[tool.uv.index]]
+    url = "https://pypi.org/simple"
+
+    [tool.uv.sources]
+    torch = { index = "pytorch-nightly-cu128" }
+    torchvision = { index = "pytorch-nightly-cu128" }
+    triton = { index = "pytorch-nightly-cu128" }
+
+    ```
