@@ -181,17 +181,17 @@ class SmolVLMBridge(VLMBridge):
             )
             attention_mask = attn_mask[:, None, :, :]
 
-        from transformers.cache_utils import DynamicCache
+        # from transformers.cache_utils import DynamicCache
         from transformers.masking_utils import create_causal_mask
 
         cache_position = torch.arange(embs.shape[1], device=embs.device)
-        past_key_values = DynamicCache()
+        # past_key_values = DynamicCache()
         causal_mask = create_causal_mask(
             config=text_model.config,
             input_embeds=embs,
             attention_mask=attention_mask,
             cache_position=cache_position,
-            past_key_values=past_key_values,
+            past_key_values=None,
             position_ids=position_ids,
         )
         position_embeddings = text_model.rotary_emb(embs, position_ids)
@@ -201,13 +201,13 @@ class SmolVLMBridge(VLMBridge):
         encoder_hidden_states_list = []
         for layer_idx, decoder_layer in enumerate(text_model.layers):
             torch.cuda.nvtx.range_push(f"layer_{layer_idx}")
-            past_key_values_this_layer = copy(past_key_values)
+            # past_key_values_this_layer = copy(past_key_values)
             outputs = apply_checkpoint_when_training(
                 self,
                 decoder_layer,
                 hidden_states,
                 attention_mask=causal_mask,
-                past_key_values=past_key_values_this_layer,
+                # past_key_values=past_key_values_this_layer,
                 position_embeddings=position_embeddings,
             )
             torch.cuda.nvtx.range_pop()

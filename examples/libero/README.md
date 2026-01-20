@@ -11,11 +11,15 @@ More training/serving commands live in `examples/libero/scripts/`.
 
 Pretrained checkpoints: [wandb runs](https://wandb.ai/elijahgalahad/vla-scratch/workspace?nw=iztnlef3txj)
 
-| Huggingface Id                                                                                            | Gradient Steps | Run Time | Success Rate |
-|-----------------------------------------------------------------------------------------------------------|----------------|----------|--------------|
-| [`elijahgalahad/libero-spatial-qwen`](https://huggingface.co/elijahgalahad/libero-spatial-qwen)           | 10k            | 2h 58m   | 94%          |
-| [`elijahgalahad/libero-spatial-paligemma`](https://huggingface.co/elijahgalahad/libero-spatial-paligemma) | 10k            | 4h 14m   | 88%          |
-| [`elijahgalahad/libero-spatial-smolvlm`](https://huggingface.co/elijahgalahad/libero-spatial-smolvlm)     | 10k            | 2h 18m   | 76%          |
+| Huggingface Id                                                                                                    | Gradient Steps | Run Time | Success Rate |
+|-------------------------------------------------------------------------------------------------------------------|----------------|----------|--------------|
+| [`elijahgalahad/libero-spatial-qwen-10k`](https://huggingface.co/elijahgalahad/libero-spatial-qwen-10k)           | 10k            | 2h 58m   | 94%          |
+| [`elijahgalahad/libero-spatial-paligemma-10k`](https://huggingface.co/elijahgalahad/libero-spatial-paligemma-10k) | 10k            | 4h 14m   | 88%          |
+| [`elijahgalahad/libero-spatial-smolvlm-10k`](https://huggingface.co/elijahgalahad/libero-spatial-smolvlm-10k)     | 10k            | 2h 18m   | 76%          |
+| [`elijahgalahad/libero-spatial-qwen-30k`](https://huggingface.co/elijahgalahad/libero-spatial-qwen)               | 30k            | 8h 52m   | 92%          |
+| [`elijahgalahad/libero-spatial-paligemma-30k`](https://huggingface.co/elijahgalahad/libero-spatial-paligemma)     | 30k            | 12h 51m  | 91%          |
+| [`elijahgalahad/libero-spatial-smolvlm-30k`](https://huggingface.co/elijahgalahad/libero-spatial-smolvlm)         | 30k            | 6h 45m   | 85%          |
+
 
 ## 🤖 Simulation Environment
 
