@@ -1,4 +1,4 @@
-### Training
+## Training
 ```bash
 # LIBERO with Qwen3-VL
 uv run torchrun --standalone --nnodes=1 --nproc_per_node=8 \
@@ -31,5 +31,23 @@ uv run torchrun --standalone --nnodes=1 --nproc_per_node=8 \
     wandb.mode=online
 ```
 
-### Evaluation
+### Upload Checkpoints
+
+The training output structure is:
+
+```
+outputs/<YYYY-MM-DD>/<HH-MM-SS>-<exp_name>/
+├── cfg.yaml                    # training config snapshot
+└── checkpoint_<epoch>/         # checkpoint directory per save interval
+    ├── model.pt                # model weights
+    └── optimizer.pt            # optimizer state (excluded from upload)
+```
+
+Use the command below to upload the latest checkpoint (automatically picks the highest-numbered `checkpoint_*`) and `cfg.yaml` to Hugging Face:
+
+```bash
+uv run bash scripts/helpers/upload_checkpoint.sh <user_name/repo_name> <checkpoint_path>
+```
+
+## Evaluation
 See [examples](examples/README.md) for details about evaluation in LIBERO and other simulation environments.
