@@ -50,4 +50,4 @@ uv run bash scripts/helpers/upload_checkpoint.sh <user_name/repo_name> <checkpoi
 ```
 
 ## Evaluation
-See [examples](examples/README.md) for details about evaluation in LIBERO and other simulation environments.
+See [examples](../examples/README.md) for details about evaluation in LIBERO and other simulation environments.
